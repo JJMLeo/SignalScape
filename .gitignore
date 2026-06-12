@@ -1,0 +1,38 @@
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Python 环境
+venv/
+env/
+.venv/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 临时文件
+*.log
+*.tmp
+_check_*.py
+_extract_*.py
+_toolbar
+_manual*
+_v3_*
+*.zip
+
+# 数据文件（如不需要上传）
+# Data/
