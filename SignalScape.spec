@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 # ============================================================
-# SignalScape - PyInstaller 打包配置（体积优化版）
+# SignalScape - PyInstaller 打包配置
 # 打包命令: pyinstaller SignalScape.spec
 # ============================================================
 
@@ -12,6 +12,9 @@ hidden_imports = [
     'matplotlib.backends.backend_wx',
     'wx._core',
 
+    # 正则表达式（使用教程富文本渲染）
+    're',
+
     # fnmatch 动态导入 (在 DataManager._match_pattern 中使用)
     'fnmatch',
 
@@ -20,9 +23,7 @@ hidden_imports = [
     'nptdms.types',
     'nptdms.utils',
 
-    # pandas/numpy 可能需要的隐藏依赖
-    'pandas._libs',
-    'pandas._libs.tslibs',
+    # numpy 隐藏依赖
     'numpy.core._methods',
     'numpy.lib.format',
 

@@ -1,7 +1,6 @@
 # PyInstaller 构建产物
 build/
 dist/
-*.spec
 __pycache__/
 *.pyc
 *.pyo
