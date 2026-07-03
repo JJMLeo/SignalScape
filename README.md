@@ -1,6 +1,19 @@
 # SignalScape - TDMS 数据可视化分析工具
 
-基于 Python + wxPython 开发的专业 **NI TDMS** 数据可视化与分析工具，支持多文件加载、智能通道筛选、交互式绘图、区域统计分析及多格式数据导出，适用于航空发动机、动力系统等测试数据的快速分析与对比。
+专业 **NI TDMS** 数据可视化与分析工具，支持多文件加载、智能通道筛选、交互式绘图、区域统计分析及多格式数据导出，适用于航空发动机、动力系统等测试数据的快速分析与对比。
+
+---
+
+## 版本说明
+
+本项目提供两种 GUI 实现，**核心功能逻辑完全一致**，仅界面框架不同：
+
+| 文件 | GUI 框架 | 说明 |
+|------|----------|------|
+| `SignalScape.py` | wxPython 4.2+ | 原始版本，WXAgg 后端 |
+| `SignalScape_pyside6.py` | PySide6 6.5+ | 新增版本，QtAgg 后端，界面经现代美化 |
+
+> **推荐使用 `SignalScape_pyside6.py`** — 基于 PySide6 / Qt 框架，界面更现代、QSS 样式表统一美化、跨平台体验更一致。
 
 ---
 
@@ -10,6 +23,7 @@
 - **单文件/批量加载** TDMS 文件，支持主备双方案容错（自动尝试禁用内存映射重载）
 - **惰性加载策略**：导入时仅读取元数据（组/通道名称），数据在首次绘制时按需读取并缓存，大幅加快大文件导入速度
 - **多文件对比**：跨文件通道叠加绘制，参数名自动带文件序号前缀（如 `文件1|通道名`）
+- **卸载文件**：右键通道树中文件节点可单独卸载，释放内存
 
 ### 智能通道筛选
 - **参数名关键字过滤**：自动排除含「故障/保留/预留/备用/空闲/删除」字样的参数
@@ -25,17 +39,19 @@
 ### 统计分析
 - **全局统计**：自动计算各通道最大值、最小值
 - **区域统计**：红蓝竖直线之间的均值、最大值、最小值
-- **有效值计算**：5 种窗口方式（前后 1/3/5/10 秒平均值、瞬时值）
+- **有效值计算**：5 种窗口方式（前后 1/3/5/10 秒平均值、瞬时值），红蓝竖直线两侧半透明阴影标注有效值窗口
 
 ### 数据导出
 - **原始数据导出 CSV**：按采样间隔分组，含时间列和各通道数值列
 - **有效值导出 CSV**：红蓝轴数值与有效值
-- **图像保存**：PNG / JPG / PDF（300 DPI），可设置坐标轴与图例字体大小，支持实时预览
+- **图像保存**：PNG / JPG / PDF，可设置坐标轴与图例字体大小，支持实时预览
 
 ### 易用性
-- **使用教程**：内置 12 章完整教程（F1 打开），涵盖所有模块功能
+- **现代 UI 界面**（PySide6 版）：QSS 样式表全局美化，清爽专业外观
+- **使用教程**：内置 11 章完整教程（F1 打开），涵盖所有模块功能
 - **快捷键支持**：主界面按钮均支持全局快捷键
 - **状态栏提示**：实时显示操作状态、加载进度、缩放信息、通道数量等
+- **防抖优化**：参数频繁变更时自动延迟重绘，避免卡顿
 
 ---
 
@@ -54,11 +70,14 @@
 
 ## 技术栈
 
-- **Python** 3.8+
-- **wxPython** 4.2+（GUI 框架）
-- **Matplotlib**（绘图，WXAgg 后端）
-- **NumPy**（数值计算）
-- **nptdms**（TDMS 文件读取）
+| 组件 | 说明 |
+|------|------|
+| **Python** | 3.8+ |
+| **PySide6** | Qt for Python 界面框架（推荐版本） |
+| **wxPython** | 经典界面框架（原始版本） |
+| **Matplotlib** | 绘图引擎 |
+| **NumPy** | 数值计算 |
+| **nptdms** | NI TDMS 文件读取 |
 
 ---
 
@@ -66,6 +85,12 @@
 
 ### 环境准备
 
+**PySide6 版本（推荐）：**
+```bash
+pip install pyside6 numpy matplotlib nptdms
+```
+
+**wxPython 版本：**
 ```bash
 pip install wxpython numpy matplotlib nptdms
 ```
@@ -73,6 +98,10 @@ pip install wxpython numpy matplotlib nptdms
 ### 运行
 
 ```bash
+# PySide6 版本（推荐）
+python SignalScape_pyside6.py
+
+# wxPython 版本
 python SignalScape.py
 ```
 
@@ -83,6 +112,10 @@ python SignalScape.py
 使用 PyInstaller 打包为独立可执行文件：
 
 ```bash
+# PySide6 版本
+pyinstaller SignalScape_pyside6.spec
+
+# wxPython 版本
 pyinstaller SignalScape.spec
 ```
 
@@ -112,11 +145,15 @@ pyinstaller SignalScape.spec
 
 ```
 SignalScape/
-├── SignalScape.py        # 主程序源代码
-├── SignalScape.spec      # PyInstaller 打包配置
-├── Dashboard.ico         # 应用图标
-├── README.md             # 项目说明（本文件）
-└── Data/                 # 测试数据文件（不随项目上传）
+├── SignalScape.py                  # wxPython 版本源代码
+├── SignalScape_pyside6.py          # PySide6 版本源代码（推荐）
+├── SignalScape.spec                # wxPython 版 PyInstaller 打包配置
+├── SignalScape_pyside6.spec        # PySide6 版 PyInstaller 打包配置
+├── Dashboard.ico                   # 应用图标
+├── README.md                       # 项目说明（本文件）
+├── Data/                           # 测试数据文件（不随项目上传）
+├── build/                          # PyInstaller 构建缓存
+└── dist/                           # 打包输出目录
 ```
 
 ---
@@ -131,7 +168,7 @@ SignalScape/
 2. **通配符级**：自定义 `*`/`?` 模式匹配
 
 ### 防抖重绘
-参数频繁变化时（如批量勾选/取消勾选），通过 150ms 防抖定时器延迟重绘，避免每次改动都触发全量重绘。
+参数频繁变化时（如批量勾选/取消勾选），通过 150ms 防抖定时器延迟重绘，避免每次改动都触发全量重绘。窗口调整大小、搜索输入等高频操作同样采用防抖策略。
 
 ---
 
