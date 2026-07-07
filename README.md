@@ -11,9 +11,9 @@
 | 文件 | GUI 框架 | 说明 |
 |------|----------|------|
 | `SignalScape.py` | wxPython 4.2+ | 原始版本，WXAgg 后端 |
-| `SignalScape_pyside6.py` | PySide6 6.5+ | 新增版本，QtAgg 后端，界面经现代美化 |
+| `SignalScape_pyside.py` | PySide2 5.15+ | 主推版本，QtAgg 后端，界面经现代美化（QSS 样式表统一美化） |
 
-> **推荐使用 `SignalScape_pyside6.py`** — 基于 PySide6 / Qt 框架，界面更现代、QSS 样式表统一美化、跨平台体验更一致。
+> **推荐使用 `SignalScape_pyside.py`** — 基于 PySide2 / Qt 框架，界面更现代、QSS 样式表统一美化、跨平台体验更一致。
 
 ---
 
@@ -39,7 +39,7 @@
 ### 统计分析
 - **全局统计**：自动计算各通道最大值、最小值
 - **区域统计**：红蓝竖直线之间的均值、最大值、最小值
-- **有效值计算**：5 种窗口方式（前后 1/3/5/10 秒平均值、瞬时值），红蓝竖直线两侧半透明阴影标注有效值窗口
+- **有效值计算**：多种窗口方式（前后 1/3/5/10 秒平均值、瞬时值），红蓝竖直线两侧半透明阴影标注有效值窗口
 
 ### 数据导出
 - **原始数据导出 CSV**：按采样间隔分组，含时间列和各通道数值列
@@ -47,8 +47,8 @@
 - **图像保存**：PNG / JPG / PDF，可设置坐标轴与图例字体大小，支持实时预览
 
 ### 易用性
-- **现代 UI 界面**（PySide6 版）：QSS 样式表全局美化，清爽专业外观
-- **使用教程**：内置 11 章完整教程（F1 打开），涵盖所有模块功能
+- **现代 UI 界面**（PySide2 版）：QSS 样式表全局美化，清爽专业外观，按钮/对话框风格统一
+- **使用教程**：内置完整教程（F1 或在菜单中打开），涵盖所有模块功能
 - **快捷键支持**：主界面按钮均支持全局快捷键
 - **状态栏提示**：实时显示操作状态、加载进度、缩放信息、通道数量等
 - **防抖优化**：参数频繁变更时自动延迟重绘，避免卡顿
@@ -73,7 +73,7 @@
 | 组件 | 说明 |
 |------|------|
 | **Python** | 3.8+ |
-| **PySide6** | Qt for Python 界面框架（推荐版本） |
+| **PySide2** | Qt for Python 界面框架（推荐版本） |
 | **wxPython** | 经典界面框架（原始版本） |
 | **Matplotlib** | 绘图引擎 |
 | **NumPy** | 数值计算 |
@@ -85,9 +85,9 @@
 
 ### 环境准备
 
-**PySide6 版本（推荐）：**
+**PySide2 版本（推荐）：**
 ```bash
-pip install pyside6 numpy matplotlib nptdms
+pip install pyside2 numpy matplotlib nptdms
 ```
 
 **wxPython 版本：**
@@ -98,8 +98,8 @@ pip install wxpython numpy matplotlib nptdms
 ### 运行
 
 ```bash
-# PySide6 版本（推荐）
-python SignalScape_pyside6.py
+# PySide2 版本（推荐）
+python SignalScape_pyside.py
 
 # wxPython 版本
 python SignalScape.py
@@ -112,8 +112,8 @@ python SignalScape.py
 使用 PyInstaller 打包为独立可执行文件：
 
 ```bash
-# PySide6 版本
-pyinstaller SignalScape_pyside6.spec
+# PySide2 版本（推荐）
+pyinstaller SignalScape_pyside.spec
 
 # wxPython 版本
 pyinstaller SignalScape.spec
@@ -137,7 +137,7 @@ pyinstaller SignalScape.spec
    - 在「有效值计算方式」(`Ctrl+E`) 中设置有效值窗口
 6. **导出结果**：通过绘图区工具栏的「导出数据」「保存图像」「导出有效值」输出分析结果
 
-> 首次使用建议按 `F1` 打开使用教程，了解各模块详细功能。
+> 首次使用建议按 `F1` 或在菜单中打开使用教程，了解各模块详细功能。
 
 ---
 
@@ -146,9 +146,9 @@ pyinstaller SignalScape.spec
 ```
 SignalScape/
 ├── SignalScape.py                  # wxPython 版本源代码
-├── SignalScape_pyside6.py          # PySide6 版本源代码（推荐）
+├── SignalScape_pyside.py           # PySide2 版本源代码（推荐）
 ├── SignalScape.spec                # wxPython 版 PyInstaller 打包配置
-├── SignalScape_pyside6.spec        # PySide6 版 PyInstaller 打包配置
+├── SignalScape_pyside.spec         # PySide2 版 PyInstaller 打包配置
 ├── Dashboard.ico                   # 应用图标
 ├── README.md                       # 项目说明（本文件）
 ├── Data/                           # 测试数据文件（不随项目上传）
@@ -168,7 +168,13 @@ SignalScape/
 2. **通配符级**：自定义 `*`/`?` 模式匹配
 
 ### 防抖重绘
-参数频繁变化时（如批量勾选/取消勾选），通过 150ms 防抖定时器延迟重绘，避免每次改动都触发全量重绘。窗口调整大小、搜索输入等高频操作同样采用防抖策略。
+参数频繁变化时（如批量勾选/取消勾选），通过防抖定时器延迟重绘，避免每次改动都触发全量重绘。窗口调整大小、搜索输入等高频操作同样采用防抖策略。
+
+### 统一界面风格
+PySide2 版本采用全局 QSS 样式表，主界面按钮与工具栏、弹出对话框按钮风格统一：
+- 默认显示浅灰轮廓边框，鼠标悬浮时变为蓝底蓝字蓝边
+- 弹出对话框按钮统一为浅灰风格（系统文件对话框由 Windows 绘制，不受影响）
+- 对话框说明文字与选项之间以分隔线区分，提升可读性
 
 ---
 
@@ -177,7 +183,7 @@ SignalScape/
 - Windows 10/11
 - Python 3.8+
 - 显示器：支持多显示器，自动定位到鼠标所在屏幕
-- 高 DPI：支持 PerMonitorV2 高清适配
+- 高 DPI：支持高清适配
 
 ---
 
