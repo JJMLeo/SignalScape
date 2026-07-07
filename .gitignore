@@ -1,6 +1,8 @@
 # PyInstaller 构建产物
 build/
 dist/
+dist_pyside/
+dist_wxpython/
 __pycache__/
 *.pyc
 *.pyo
