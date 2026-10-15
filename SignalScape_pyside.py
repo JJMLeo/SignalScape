@@ -96,8 +96,8 @@ from matplotlib.widgets import SpanSelector
 #   · 三级(PATCH)：自上次推送以来的每次代码修改 +1。
 # =============================================================================
 APP_VERSION_MAJOR = 0   # 一级：按时设置，当前 0
-APP_VERSION_MINOR = 2   # 二级：git 推送次数（本次推送 1 -> 2）
-APP_VERSION_PATCH = 0   # 三级：自上次推送以来的代码修改次数（推送归 0）
+APP_VERSION_MINOR = 1   # 二级：git 推送次数
+APP_VERSION_PATCH = 1   # 三级：自上次推送以来的代码修改次数
 APP_VERSION = "%d.%d.%d" % (APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH)
 
 
