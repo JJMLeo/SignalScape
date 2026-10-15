@@ -10,6 +10,7 @@ import warnings
 import os
 import os.path as osp
 import csv
+import datetime
 import fnmatch
 import re
 from collections import OrderedDict
@@ -85,6 +86,19 @@ mpl.rcParams.update({
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.widgets import SpanSelector
+
+
+# =============================================================================
+# 版本号（单一数据源，界面标题显示用）
+#   三级版本号：一级 . 二级 . 三级
+#   · 一级(MAJOR)：按时设置，当前为 0；
+#   · 二级(MINOR)：每次 git 推送 +1（推送时三级归 0）；
+#   · 三级(PATCH)：自上次推送以来的每次代码修改 +1。
+# =============================================================================
+APP_VERSION_MAJOR = 0   # 一级：按时设置，当前 0
+APP_VERSION_MINOR = 2   # 二级：git 推送次数（本次推送 1 -> 2）
+APP_VERSION_PATCH = 0   # 三级：自上次推送以来的代码修改次数（推送归 0）
+APP_VERSION = "%d.%d.%d" % (APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH)
 
 
 # =============================================================================
@@ -269,6 +283,7 @@ class DataManager:
         self.files_data = OrderedDict()
         self.tdms_files = {}
         self.file_paths = {}
+        self.xls_time_axis = {}  # xls文件: (file, group) → 采样时刻数组（秒）
         self._data_cache = {}
         self.sample_time = Config.DEFAULT_SAMPLE_TIME
         self.effective_value_method = "前后10秒平均值"
@@ -400,6 +415,8 @@ class DataManager:
             del self.tdms_files[file_name]
         if file_name in self.file_paths:
             del self.file_paths[file_name]
+        for k in [k for k in self.xls_time_axis if k[0] == file_name]:
+            del self.xls_time_axis[k]
         keys_to_remove = [k for k in self._data_cache if k[0] == file_name]
         for k in keys_to_remove:
             del self._data_cache[k]
@@ -446,10 +463,176 @@ class DataManager:
         channels = sum(len(ch) for ch in self.files_data[file_name].values())
         return {"groups": groups, "channels": channels}
 
+    # ------------------------------------------------------------------
+    # Excel (.xls) 试验数据读取
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_hms_to_seconds(value):
+        """将采样时刻解析为秒：支持 'H:MM:SS'/'HH:MM:SS' 文本及 Excel 时间小数。"""
+        if isinstance(value, str):
+            s = value.strip()
+            m = re.match(r'^(\d{1,3}):(\d{1,2})(?::(\d{1,2}))?', s)
+            if m:
+                h, mi, se = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+                return h * 3600.0 + mi * 60.0 + se
+            try:
+                return float(s)
+            except ValueError:
+                return None
+        if isinstance(value, datetime.datetime):
+            t = value.time()
+            return t.hour * 3600.0 + t.minute * 60.0 + t.second + t.microsecond / 1e6
+        if isinstance(value, datetime.time):
+            return value.hour * 3600.0 + value.minute * 60.0 + value.second + value.microsecond / 1e6
+        if isinstance(value, (int, float)):
+            v = float(value)
+            if 0.0 <= v < 1.0:  # Excel 时间单元格（一天的小数）
+                return v * 86400.0
+            return v
+        return None
+
+    def load_excel_file(self, file_path):
+        """读取 Excel 试验数据文件（.xls/.xlsx，统一使用 python-calamine）。
+
+        依赖：pip install python-calamine （单个 Rust 库同时支持 .xls 与 .xlsx，
+        替代原先的 xlrd + openpyxl 双库，减小打包体积）。
+        """
+        file_name = osp.basename(file_path)
+        if file_name in self.files_data:
+            QMessageBox.information(None, "提示", f"文件 '{file_name}' 已经打开！")
+            return False
+        try:
+            from python_calamine import CalamineWorkbook
+        except ImportError:
+            QMessageBox.critical(None, "缺少依赖",
+                                 "读取 Excel 文件需要 python-calamine 库，请先安装:\n\npip install python-calamine")
+            return False
+        try:
+            wb = CalamineWorkbook.from_path(file_path)
+            rows = wb.get_sheet_by_index(0).to_python()
+        except Exception as e:
+            QMessageBox.critical(None, "文件加载错误",
+                                 f"打开文件失败: {file_name}\n\n{type(e).__name__}: {str(e)}")
+            return False
+
+        nrows = len(rows)
+        ncols = max((len(r) for r in rows), default=0)
+
+        def cell_value(r, c):
+            if 0 <= r < nrows and c < len(rows[r]):
+                v = rows[r][c]
+                return '' if v is None else v
+            return ''
+
+        def fmt_date(v):
+            if isinstance(v, datetime.date):  # datetime.datetime 亦为其子类
+                return v.strftime('%Y-%m-%d')
+            if isinstance(v, str):
+                return v.strip()
+            return ""
+
+        return self._load_excel_common(file_path, file_name, nrows, ncols, cell_value, fmt_date)
+
+
+    def _load_excel_common(self, file_path, file_name, nrows, ncols, cell_value, fmt_date):
+        """从已打开的 Excel 工作表读取试验数据（.xls / .xlsx 共用）。
+
+        格式约定：
+          第1行 试验日期；第3行 变量编号（第2列起为参数名称）；
+          第4行 变量名称；第5行 参数单位；第6行及以下为实测数据。
+          第1列为采样时刻（HH:MM:SS），第2列起为各参数实测值。
+        cell_value(r, c) 以 0 为起始索引返回单元格原始值；fmt_date(v) 用于把
+        第1行日期单元格转成字符串（不同库对日期的表示不同）。
+        """
+        if nrows < 6 or ncols < 2:
+            QMessageBox.critical(None, "文件加载错误",
+                                 f"文件格式不正确（数据行不足）: {file_name}")
+            return False
+
+        # 试验日期（第1行）作为组名的一部分
+        try:
+            date_str = fmt_date(cell_value(0, 0))
+        except Exception:
+            date_str = ""
+        group_name = f"试验数据({date_str})" if date_str else "试验数据"
+
+        # 解析采样时刻（第6行及以下，第1列）
+        t_seconds = []
+        for r in range(5, nrows):
+            t = self._parse_hms_to_seconds(cell_value(r, 0))
+            if t is None:
+                continue
+            t_seconds.append(t)
+        if not t_seconds:
+            QMessageBox.critical(None, "文件加载错误",
+                                 f"未解析到有效的采样时刻数据: {file_name}")
+            return False
+        t_arr = np.asarray(t_seconds, dtype=float)
+        time_axis = t_arr - t_arr[0]  # 相对首个采样点的秒数
+        n_points = len(t_arr)
+
+        # 解析参数名称（第4行变量名称，缺失时回退第3行变量编号）
+        self.files_data[file_name] = {}
+        self.file_paths[file_name] = file_path
+        self.files_data[file_name][group_name] = OrderedDict()
+        self.xls_time_axis[(file_name, group_name)] = time_axis
+
+        used_names = set()
+        loaded = 0
+        excluded = 0
+        for col in range(1, ncols):
+            name = str(cell_value(3, col)).strip() if nrows > 3 else ""
+            if not name or name.lower() in ('none', 'nan'):
+                name = str(cell_value(2, col)).strip() if nrows > 2 else ""
+            if not name or name.lower() in ('none', 'nan'):
+                continue
+
+            if self.should_exclude_channel(name, data=None):
+                excluded += 1
+                continue
+
+            # 重名处理
+            base_name, suffix = name, 2
+            while name in used_names:
+                name = f"{base_name}_{suffix}"
+                suffix += 1
+            used_names.add(name)
+
+            # 读取实测数据（数据行与采样时刻行数对齐）
+            values = []
+            for r in range(5, nrows):
+                t = self._parse_hms_to_seconds(cell_value(r, 0))
+                if t is None:
+                    continue
+                try:
+                    v = float(cell_value(r, col))
+                except (TypeError, ValueError):
+                    v = np.nan
+                values.append(v)
+            if len(values) == 0:
+                continue
+            data = np.asarray(values[:n_points], dtype=float)
+
+            self.files_data[file_name][group_name][name] = True  # 占位，数据在缓存中
+            self._data_cache[(file_name, group_name, name)] = data
+            loaded += 1
+
+        if excluded > 0:
+            QMessageBox.information(None, "筛选信息",
+                                    f"已排除 {excluded} 个参数（命中导入过滤规则）")
+        if loaded == 0:
+            del self.files_data[file_name]
+            self.xls_time_axis.pop((file_name, group_name), None)
+            QMessageBox.critical(None, "文件加载错误",
+                                 f"未从文件中读取到有效参数: {file_name}")
+            return False
+        return True
+
     def clear(self):
         self.files_data.clear()
         self.tdms_files.clear()
         self.file_paths.clear()
+        self.xls_time_axis.clear()
         self._data_cache.clear()
         gc.collect()
 
@@ -1296,6 +1479,10 @@ class MatplotlibPlotPanel(QWidget):
         self.blue_shadow = None
         self.span_selector = None
         self.dragging = None
+        # 数据录取竖直线（紫色，可多条，可拖动）
+        self.record_lines = []      # [{'x': float}, ...]
+        self.record_artists = []    # 当前绘制的artist引用
+        self.dragging_record = None
         self.right_axes_dict = {}
         self.x_max = Config.DEFAULT_WINDOW_DURATION
         self.crosshair_v = None
@@ -1370,6 +1557,13 @@ class MatplotlibPlotPanel(QWidget):
         self.blue_line_check.stateChanged.connect(self._on_blue_line_toggle)
         layout.addWidget(self.blue_line_check)
 
+        # 数据录取按钮（数值线右侧）
+        self.record_btn = QPushButton("数据录取")
+        self.record_btn.setObjectName("tool_btn")
+        self.record_btn.setToolTip("在曲线绘制区域添加一条数据录取竖直线（紫色，可鼠标拖动）")
+        self.record_btn.clicked.connect(self._on_add_record_line)
+        layout.addWidget(self.record_btn)
+
         layout.addSpacing(6)
         self.show_shadow_check = QCheckBox("有效值阴影")
         self.show_shadow_check.setToolTip("选中后，红蓝竖直线两侧会显示半透明阴影区域")
@@ -1430,6 +1624,8 @@ class MatplotlibPlotPanel(QWidget):
         self.crosshair_text = None
         self.red_shadow = None
         self.blue_shadow = None
+        # 重置数据录取线artist引用（axes.clear() 已删除原对象，录取线位置保留）
+        self.record_artists = []
 
     def _prepare_plot_data(self, plots_data, parameters, show_actual_value_channels, top_channels):
         max_x = max((np.max(pd['x_data']) for pd in plots_data if len(pd['x_data']) > 0),
@@ -1628,8 +1824,17 @@ class MatplotlibPlotPanel(QWidget):
             if self.span_selector:
                 self.span_selector.set_active(False)
         else:
-            if self.span_selector:
-                self.span_selector.set_active(True)
+            # 检查数据录取线拖拽
+            self.dragging_record = None
+            for i, rec in enumerate(self.record_lines):
+                if self._is_near_line(event.xdata, rec['x']):
+                    self.dragging_record = i
+                    if self.span_selector:
+                        self.span_selector.set_active(False)
+                    break
+            if self.dragging_record is None:
+                if self.span_selector:
+                    self.span_selector.set_active(True)
 
     def _on_mouse_motion(self, event):
         if event.inaxes != self.axes or event.xdata is None or event.ydata is None:
@@ -1643,6 +1848,15 @@ class MatplotlibPlotPanel(QWidget):
             self._update_vertical_lines()
             self._hide_crosshair()
             return
+
+        # 拖拽数据录取线模式
+        if self.dragging_record is not None:
+            if 0 <= self.dragging_record < len(self.record_lines):
+                self.record_lines[self.dragging_record]['x'] = event.xdata
+                self._update_record_lines()
+            self._hide_crosshair()
+            return
+
         self._update_crosshair(event.xdata, event.ydata)
 
     def _update_crosshair(self, x, y):
@@ -1680,6 +1894,10 @@ class MatplotlibPlotPanel(QWidget):
             if self.span_selector:
                 self.span_selector.set_active(True)
             self.dragging = None
+        if self.dragging_record is not None:
+            if self.span_selector:
+                self.span_selector.set_active(True)
+            self.dragging_record = None
 
     def _on_navigation(self, event):
         if hasattr(event, 'dblclick') and event.dblclick and event.inaxes == self.axes:
@@ -1767,7 +1985,101 @@ class MatplotlibPlotPanel(QWidget):
                 ha='left', va='bottom', fontweight='bold', zorder=11)
 
         self.on_vertical_lines_changed(self.red_line_x, self.blue_line_x)
+        # 同步刷新数据录取线位置（随坐标范围变化重新定位标注）
+        self._update_record_lines()
         self.canvas.draw()
+
+    # ------------------------------------------------------------------
+    # 数据录取竖直线（紫色）
+    # ------------------------------------------------------------------
+    def _on_add_record_line(self):
+        """添加数据录取竖直线"""
+        if not self.current_plots:
+            QMessageBox.information(self, "提示", "请先绘制参数曲线后再添加数据录取线")
+            return
+        xlim = self.axes.get_xlim()
+        x = xlim[0] + (xlim[1] - xlim[0]) * 0.5
+        self.record_lines.append({'x': x})
+        self._update_record_lines()
+        self.canvas.draw()
+
+    def _update_record_lines(self):
+        """绘制/刷新所有数据录取竖直线及其有效值标注"""
+        for artist in self.record_artists:
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        self.record_artists = []
+
+        if not self.record_lines:
+            return
+
+        ylim = self.axes.get_ylim()
+        xlim = self.axes.get_xlim()
+        x_span = xlim[1] - xlim[0]
+        y_range = ylim[1] - ylim[0]
+        y_bottom = ylim[0] + y_range * 0.02  # 横轴以下显示时刻
+
+        main_frame = self.window()
+        window_size = getattr(getattr(main_frame, 'data_manager', None),
+                              'effective_value_window', 0.0)
+        dx = x_span * 0.005
+
+        for i, rec in enumerate(self.record_lines, 1):
+            x = rec['x']
+            line = self.axes.axvline(x=x, color='purple', linewidth=1,
+                                     linestyle='-', zorder=10, alpha=0.8)
+            self.record_artists.append(line)
+            time_text = self.axes.text(
+                x + dx, y_bottom, f"{x:.3f}s",
+                color='purple', fontsize=8, ha='left', va='top',
+                fontweight='bold', zorder=11)
+            self.record_artists.append(time_text)
+
+            # 每条参数曲线在该时刻的有效值标注（交点右上方，颜色与曲线一致）
+            for name, plot_line in self.current_plots.items():
+                data = self.original_data.get(name)
+                if data is None or len(data['x']) == 0:
+                    continue
+                xd, yd = data['x'], data['y']
+                idx = int(np.argmin(np.abs(xd - x)))
+                y_raw = float(yd[idx])
+                # 百分比模式下曲线按各自量程归一化到 0~100，标注必须使用同一
+                # 归一化坐标，否则会偏离曲线甚至超出坐标轴被裁剪而“看不见”
+                if self._is_percent_mode():
+                    ymn, ymx = float(np.min(yd)), float(np.max(yd))
+                    y_pos = ((y_raw - ymn) / (ymx - ymn) * 100.0) if ymx != ymn else 100.0
+                else:
+                    y_pos = y_raw
+                eff = self._calc_effective_value(name, x, window_size)
+                if eff is None:
+                    continue
+                txt = plot_line.axes.text(
+                    x + dx, y_pos, eff,
+                    color=plot_line.get_color(), fontsize=7,
+                    ha='left', va='bottom', zorder=12)
+                self.record_artists.append(txt)
+
+    def _calc_effective_value(self, channel_name, line_x, window_size=None):
+        """计算录取线时刻的有效值（与红/蓝竖直线计算方式一致）"""
+        data = self.original_data.get(channel_name)
+        if not data or len(data['x']) == 0:
+            return None
+        if window_size is None:
+            main_frame = self.window()
+            window_size = getattr(getattr(main_frame, 'data_manager', None),
+                                  'effective_value_window', 10.0)
+        x, y = data['x'], data['y']
+        if window_size == 0.0:  # 瞬时值
+            idx = int(np.argmin(np.abs(x - line_x)))
+            if abs(x[idx] - line_x) < 0.1:
+                return f"{y[idx]:.6f}"
+            return None
+        mask = (x >= line_x - window_size) & (x <= line_x + window_size)
+        if not np.any(mask):
+            return None
+        return f"{np.mean(y[mask]):.6f}"
 
     def _is_near_line(self, x, line_x, threshold=0.01):
         if line_x is None:
@@ -1876,8 +2188,9 @@ class MatplotlibPlotPanel(QWidget):
             return
         has_red_line = self.red_line_x is not None
         has_blue_line = self.blue_line_x is not None
-        if not has_red_line and not has_blue_line:
-            QMessageBox.information(self, "提示", "请先添加红色或蓝色竖直线")
+        has_records = bool(self.record_lines)
+        if not has_red_line and not has_blue_line and not has_records:
+            QMessageBox.information(self, "提示", "请先添加红色/蓝色竖直线或数据录取线")
             return
         file_path, _ = QFileDialog.getSaveFileName(self, "导出有效值", "", "CSV files (*.csv);;All files (*.*)")
         if file_path:
@@ -2030,6 +2343,9 @@ class MatplotlibPlotPanel(QWidget):
             parameter_names = []
             red_values, red_effective_values = [], []
             blue_values, blue_effective_values = [], []
+            # 数据录取线（按前后时刻顺序导出有效值，不含时刻数据）
+            record_xs = sorted(rec['x'] for rec in self.record_lines)
+            record_effective_values = [[] for _ in record_xs]
             for i in range(param_panel.grid.rowCount()):
                 display_item = param_panel.grid.item(i, 0)
                 if not display_item or not display_item.text():
@@ -2046,6 +2362,9 @@ class MatplotlibPlotPanel(QWidget):
                 if has_blue_line:
                     blue_values.append(param_panel.grid.item(i, 14).text() if param_panel.grid.item(i, 14) else "")
                     blue_effective_values.append(param_panel.grid.item(i, 16).text() if param_panel.grid.item(i, 16) else "")
+                for j, rx in enumerate(record_xs):
+                    eff = self._calc_effective_value(display_name, rx)
+                    record_effective_values[j].append(eff if eff is not None else "N/A")
             headers = ["参数名称"] + parameter_names
             writer.writerow(headers)
             if has_red_line:
@@ -2054,6 +2373,9 @@ class MatplotlibPlotPanel(QWidget):
             if has_blue_line:
                 writer.writerow([f"蓝轴数值({self.blue_line_x:.3f}s)"] + blue_values)
                 writer.writerow([f"蓝轴有效值({self.blue_line_x:.3f}s)"] + blue_effective_values)
+            # 数据录取线：按前后时刻顺序依次导出有效值（仅有效值，不含时刻）
+            for j in range(len(record_xs)):
+                writer.writerow([f"数据录取{j + 1}有效值"] + record_effective_values[j])
 
     def clear_plot(self):
         self._clear_plot()
@@ -2789,31 +3111,38 @@ class UserGuideDialog(QDialog):
             "欢迎使用 SignalScape - TDMS 数据可视化分析工具。",
             "【声明】本软件仅限内部使用，禁止对外分发与商业用途。",
             "",
-            "本软件用于加载、筛选、绘制和分析 NI TDMS 格式的测试数据文件，支持多文件对比、交互式绘图、统计分析及数据导出。",
+            "本软件用于加载、筛选、绘制和分析 NI TDMS 格式及 Excel（.xls/.xlsx）试验数据文件，支持多文件对比、交互式绘图、统计分析及数据导出。",
             "",
             "基本工作流程：",
-            "    1. 点击「打开TDMS文件」或「批量打开」加载数据文件",
+            "    1. 点击「打开数据文件」或「批量打开」加载数据文件（支持 TDMS / Excel）",
             "    2. 在左侧通道树中双击通道，将其加入下方参数表格",
             "    3. 勾选参数表格中的「绘制曲线」列即可在绘图区显示曲线",
             "    4. 使用红蓝竖直线、范围选择、滚轮缩放等工具进行分析",
             "    5. 通过「导出数据」「保存图像」「导出有效值」输出结果",
             "",
             "按钮快捷键（括号内为快捷键，全局生效）：",
-            "    打开TDMS文件 (Ctrl+O)    批量打开 (Ctrl+B)    导入选项 (Ctrl+I)",
+            "    打开数据文件 (Ctrl+O)    批量打开 (Ctrl+B)    导入选项 (Ctrl+I)",
             "    有效值计算方式 (Ctrl+E)  数据筛选设置 (Ctrl+F)  使用教程 (F1)",
         ]),
         ("数据文件加载", [
-            "「打开TDMS文件」按钮",
-            "    加载单个 .tdms 文件。若已有文件打开，会询问是「仅打开新文件」还是「添加新文件」。",
+            "「打开数据文件」按钮",
+            "    加载单个数据文件，支持 TDMS (.tdms) 与 Excel (.xls/.xlsx) 两种格式，",
+            "    会根据所选文件的扩展名自动调用对应的导入逻辑。",
+            "    若已有文件打开，会询问是「仅打开新文件」还是「添加新文件」。",
             "",
             "「批量打开」按钮",
-            "    一次选择多个 .tdms 文件批量加载，带进度提示。",
+            "    一次选择多个数据文件批量加载，带进度提示；同样支持 TDMS 与 Excel。",
             "",
-            "导入过程说明：",
+            "Excel (.xls/.xlsx) 试验数据格式约定：",
+            "    第1行 试验日期；第3行 变量编号；第4行 变量名称；第5行 参数单位；",
+            "    第6行及以下为实测数据，第1列为采样时刻（HH:MM:SS），第2列起为各参数实测值。",
+            "    读取 Excel 需安装 python-calamine（单个库同时支持 .xls/.xlsx）。",
+            "",
+            "TDMS 导入过程说明：",
             "    软件采用惰性加载策略——导入时只读取文件元数据（组/通道名称），不读取具体数据。",
             "    数据在首次绘制时才按需读取并缓存，从而加快大文件导入速度。",
             "",
-            "若文件加载失败，软件会自动尝试诊断恢复加载方式（禁用内存映射），并弹出详细错误报告。",
+            "若 TDMS 文件加载失败，软件会自动尝试诊断恢复加载方式（禁用内存映射），并弹出详细错误报告。",
         ]),
         ("导入选项", [
             "「导入选项」按钮",
@@ -3093,7 +3422,7 @@ class SignalScapeMainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SignalScape - TDMS数据可视化工具")
+        self.setWindowTitle(f"SignalScape v{APP_VERSION} - TDMS数据可视化工具")
 
         self.data_manager = DataManager()
 
@@ -3122,7 +3451,7 @@ class SignalScapeMainWindow(QMainWindow):
         """)
 
         buttons = [
-            ("打开TDMS文件", self._on_open, "Ctrl+O"),
+            ("打开数据文件", self._on_open, "Ctrl+O"),
             ("批量打开", self._on_batch_open, "Ctrl+B"),
             ("导入选项", self._on_import_options, "Ctrl+I"),
             ("有效值计算方式", self._on_effective_value_settings, "Ctrl+E"),
@@ -3320,13 +3649,15 @@ class SignalScapeMainWindow(QMainWindow):
 
     def _on_open(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "打开TDMS文件", "", "TDMS files (*.tdms);;All files (*.*)")
+            self, "打开数据文件", "",
+            "数据文件 (*.tdms *.xls *.xlsx);;TDMS files (*.tdms);;Excel files (*.xls *.xlsx);;All files (*.*)")
         if file_path:
             self._handle_file_open(file_path)
 
     def _on_batch_open(self):
         file_paths, _ = QFileDialog.getOpenFileNames(
-            self, "批量打开TDMS文件", "", "TDMS files (*.tdms);;All files (*.*)")
+            self, "批量打开数据文件", "",
+            "数据文件 (*.tdms *.xls *.xlsx);;TDMS files (*.tdms);;Excel files (*.xls *.xlsx);;All files (*.*)")
         if not file_paths:
             return
 
@@ -3361,7 +3692,12 @@ class SignalScapeMainWindow(QMainWindow):
                 bridge.progress_update.emit(progress, f"正在加载: {file_name}")
                 if file_name in self.data_manager.files_data:
                     continue
-                if self.data_manager.load_tdms_file(file_path, parent_window=self):
+                lower_path = file_path.lower()
+                if lower_path.endswith('.xls') or lower_path.endswith('.xlsx'):
+                    load_ok = self.data_manager.load_excel_file(file_path)
+                else:
+                    load_ok = self.data_manager.load_tdms_file(file_path, parent_window=self)
+                if load_ok:
                     bridge.tree_update.emit(file_name)
                     success_count[0] += 1
                 elif self.data_manager._last_load_error:
@@ -3399,6 +3735,23 @@ class SignalScapeMainWindow(QMainWindow):
             elif result == 2:  # 取消
                 return
             # result == 1: 添加新文件
+
+        # Excel (.xls/.xlsx) 试验数据文件：统一用 python-calamine 同步加载
+        lower_path = file_path.lower()
+        if lower_path.endswith('.xls') or lower_path.endswith('.xlsx'):
+            try:
+                success = self.data_manager.load_excel_file(file_path)
+            except Exception as e:
+                QMessageBox.critical(self, "错误",
+                                     f"加载文件失败: {file_name}\n\n{type(e).__name__}: {str(e)}")
+                return
+            if success:
+                self._update_channel_tree(file_name)
+                self._update_status_after_load(file_name)
+                self.status_bar.showMessage(f"已加载: {file_name}")
+            else:
+                self.status_bar.showMessage("文件加载失败")
+            return
 
         def on_load_finished(loaded_file_path, success):
             if success:
@@ -3641,7 +3994,13 @@ class SignalScapeMainWindow(QMainWindow):
         for display_name, param_info in parameters.items():
             channel_data = self._get_channel_data(param_info['full_path'])
             if channel_data is not None:
-                time_axis = np.arange(len(channel_data)) * param_info['sample_time'] / 1000.0
+                # xls 试验数据使用实际采样时刻作为横轴，其他文件按采样间隔生成
+                time_axis = None
+                parts = param_info['full_path'].split('/')
+                if len(parts) == 3:
+                    time_axis = self.data_manager.xls_time_axis.get((parts[0], parts[1]))
+                if time_axis is None or len(time_axis) != len(channel_data):
+                    time_axis = np.arange(len(channel_data)) * param_info['sample_time'] / 1000.0
                 plots_data.append({'x_data': time_axis, 'y_data': channel_data, 'name': display_name})
         if plots_data:
             show_actual_channels = self.param_panel.get_show_actual_value_channels()
