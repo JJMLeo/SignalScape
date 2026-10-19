@@ -42,11 +42,11 @@ from PySide2.QtWidgets import (
 )
 from PySide2.QtGui import (
     QColor, QFont, QIcon, QPainter, QPen, QBrush,
-    QKeySequence,
+    QKeySequence, QDesktopServices,
     QCursor, Qt,
 )
 from PySide2.QtCore import (
-    QTimer, QPoint, QRect, QSize, Signal, Slot, QObject,
+    QTimer, QPoint, QRect, QSize, Signal, Slot, QObject, QUrl,
 )
 
 # 日志：默认不输出（NullHandler），打包运行时可通过 setup_logging() 挂文件 handler
@@ -109,7 +109,7 @@ from matplotlib.widgets import SpanSelector
 # =============================================================================
 APP_VERSION_MAJOR = 0   # 一级：按时设置，当前 0
 APP_VERSION_MINOR = 1   # 二级：git 推送次数
-APP_VERSION_PATCH = 4   # 三级：自上次推送以来的代码修改次数
+APP_VERSION_PATCH = 5   # 三级：自上次推送以来的代码修改次数
 APP_VERSION = "%d.%d.%d" % (APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH)
 
 
@@ -2456,6 +2456,28 @@ class MatplotlibPlotPanel(QWidget):
         except Exception:
             pass
 
+    def _show_export_success(self, title, text, file_path):
+        """导出/保存成功的提示对话框，附带「打开文件」按钮便于立即查看结果"""
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setText(text)
+        open_btn = box.addButton("打开文件", QMessageBox.ActionRole)
+        box.addButton("关闭", QMessageBox.RejectRole)
+        box.exec_()
+        if box.clickedButton() is open_btn:
+            self._open_file_with_default_app(file_path)
+
+    def _open_file_with_default_app(self, file_path):
+        """用系统默认程序打开文件（CSV → 表格软件，图像 → 看图软件等）"""
+        try:
+            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(osp.abspath(file_path)))
+            if not opened:
+                raise RuntimeError("系统拒绝打开该文件")
+        except Exception as e:
+            logger.warning("打开导出文件失败 %s: %s", file_path, e)
+            QMessageBox.critical(self, "错误",
+                                 f"无法打开文件:\n{file_path}\n\n{type(e).__name__}: {e}")
+
     def on_export_data(self):
         if not self.original_data:
             QMessageBox.information(self, "提示", "没有数据可导出")
@@ -2464,7 +2486,7 @@ class MatplotlibPlotPanel(QWidget):
         if file_path:
             try:
                 self._export_data_advanced(file_path)
-                QMessageBox.information(self, "成功", f"数据已导出到: {file_path}")
+                self._show_export_success("成功", f"数据已导出到:\n{file_path}", file_path)
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"导出数据失败: {str(e)}")
 
@@ -2482,7 +2504,7 @@ class MatplotlibPlotPanel(QWidget):
         if file_path:
             try:
                 self._export_effective_values_csv(file_path, has_red_line, has_blue_line)
-                QMessageBox.information(self, "成功", f"有效值已导出到: {file_path}")
+                self._show_export_success("成功", f"有效值已导出到:\n{file_path}", file_path)
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"导出有效值失败: {str(e)}")
 
@@ -2542,7 +2564,7 @@ class MatplotlibPlotPanel(QWidget):
         if file_path:
             try:
                 self.figure.savefig(file_path, dpi=300, bbox_inches='tight')
-                QMessageBox.information(self, "成功", f"图像已保存到: {file_path}")
+                self._show_export_success("成功", f"图像已保存到:\n{file_path}", file_path)
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"保存图像失败: {str(e)}")
 

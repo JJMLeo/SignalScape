@@ -332,6 +332,19 @@ class TestMainWindow(unittest.TestCase):
         pp.record_lines = []
         pp._update_record_lines()
 
+    def test_open_file_with_default_app(self):
+        """打开导出文件的辅助方法不应抛异常（存在/不存在的文件都要优雅处理）"""
+        pp = self.win.plot_panel
+        tmp = os.path.join(FIXTURES, '_tmp_open_test.txt')
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write('test')
+        try:
+            pp._open_file_with_default_app(tmp)
+            pp._open_file_with_default_app('Z:/不存在的/文件.csv')  # 只应记日志/提示，不抛
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
     def test_close_releases_data(self):
         win = self.win
         win.data_manager.load_tdms_file(TDMS_PATH)
