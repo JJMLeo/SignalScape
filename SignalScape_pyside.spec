@@ -9,6 +9,10 @@ import os
 import sys
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_dynamic_libs
 
+# 项目根目录（spec 所在位置），图标等资源用相对路径，换机/换目录不再失效
+PROJECT_ROOT = os.path.dirname(os.path.abspath(SPEC))
+ICON_PATH = os.path.join(PROJECT_ROOT, 'Dashboard.ico')
+
 # ============================================================
 # PySide2 自动收集（解决 DLL 找不到问题）
 # ============================================================
@@ -238,7 +242,7 @@ a.datas = [
 ]
 
 # 将软件图标随包收集，供运行时 QIcon 加载（解决标题栏/任务栏图标问题）
-a.datas.append(('Dashboard.ico', r'E:\python\SignalScape\Dashboard.ico', 'DATA'))
+a.datas.append(('Dashboard.ico', ICON_PATH, 'DATA'))
 
 # 去重 PySide2 二进制文件（避免与自动收集的 DLL 重复）
 # 注意：只比较文件名（不含路径），因为内置 hook 的 name 是 'Qt5Widgets.dll'
@@ -409,7 +413,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=r'E:\python\SignalScape\Dashboard.ico',
+    icon=ICON_PATH,
 )
 
 coll = COLLECT(
@@ -440,5 +444,5 @@ exe_onefile = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=r'E:\python\SignalScape\Dashboard.ico',
+    icon=ICON_PATH,
 )

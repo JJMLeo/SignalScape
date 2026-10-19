@@ -7,6 +7,7 @@ SignalScape - TDMS数据可视化分析工具 (PySide2 版本)
 import sys
 import threading
 import warnings
+import logging
 import os
 import os.path as osp
 import csv
@@ -48,7 +49,18 @@ from PySide2.QtCore import (
     QTimer, QPoint, QRect, QSize, Signal, Slot, QObject,
 )
 
-warnings.filterwarnings("ignore")
+# 日志：默认不输出（NullHandler），打包运行时可通过 setup_logging() 挂文件 handler
+logger = logging.getLogger("SignalScape")
+logger.addHandler(logging.NullHandler())
+
+# 只屏蔽已知的第三方噪音，保留 RuntimeWarning（numpy 空切片 mean 等），
+# 避免静默产生 NaN。警告统一汇入 logging，便于排查。
+for _cat in (DeprecationWarning, PendingDeprecationWarning,
+             ImportWarning, ResourceWarning, UserWarning):
+    warnings.filterwarnings("ignore", category=_cat)
+warnings.filterwarnings("ignore", message=".*tight_layout.*")
+warnings.filterwarnings("ignore", message=".*More than \\d+ figures.*")
+logging.captureWarnings(True)
 os.environ['PIL_WARNINGS'] = '0'
 
 import matplotlib as mpl
@@ -97,7 +109,7 @@ from matplotlib.widgets import SpanSelector
 # =============================================================================
 APP_VERSION_MAJOR = 0   # 一级：按时设置，当前 0
 APP_VERSION_MINOR = 1   # 二级：git 推送次数
-APP_VERSION_PATCH = 3   # 三级：自上次推送以来的代码修改次数
+APP_VERSION_PATCH = 4   # 三级：自上次推送以来的代码修改次数
 APP_VERSION = "%d.%d.%d" % (APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH)
 
 
@@ -224,14 +236,36 @@ QFrame#card { background-color: #ffffff; border: 1px solid #e8ecf1; border-radiu
 # =============================================================================
 # 工具函数
 # =============================================================================
+def nearest_index(x, value):
+    """返回数组 x 中数值最接近 value 的下标（空数组返回 -1）
+
+    时间轴通常单调递增，用二分查找替代 np.argmin(np.abs(x - value)) 的整数组
+    扫描，百万点级别可快 1~2 个数量级；非升序时退回线性扫描。
+    """
+    n = len(x)
+    if n == 0:
+        return -1
+    if n == 1:
+        return 0
+    if x[0] <= x[-1]:
+        idx = int(np.searchsorted(x, value))
+        if idx >= n:
+            idx = n - 1
+        elif idx > 0 and abs(x[idx - 1] - value) <= abs(x[idx] - value):
+            idx -= 1
+        return idx
+    return int(np.argmin(np.abs(x - value)))
+
+
 def _set_status_text_safe(status_bar, text):
     """安全更新状态栏文本"""
     if not status_bar:
         return
     try:
         status_bar.showMessage(text)
-    except Exception:
-        pass
+    except Exception as e:
+        # 状态栏可能在窗口销毁后才收到跨线程消息，记日志即可
+        logger.debug("更新状态栏失败: %s", e)
 
 
 # =============================================================================
@@ -255,10 +289,43 @@ class SignalBridge(QObject):
 # Config / DataManager
 # =============================================================================
 class Config:
-    """配置常量类"""
+    """配置常量类（界面/算法相关的可调参数集中在此，避免在代码里散落魔法值）"""
     DEFAULT_SAMPLE_TIME = 20.0
     DEFAULT_WINDOW_DURATION = 10.0
     DEFAULT_LINEWIDTH = 0.5
+
+    # 绘图：超过该点数才做 LTTB 降采样，输出点数即该阈值
+    DOWNSAMPLE_THRESHOLD = 4000
+    # 通道数据缓存条目上限（LRU），防止长时间浏览大文件后内存无限膨胀
+    CACHE_MAX_ITEMS = 256
+    # 拖拽/滚轮等高频交互的合并刷新间隔（毫秒）
+    DRAG_UPDATE_INTERVAL_MS = 80
+    # 参数表格改动后的防抖重绘间隔（毫秒）
+    REDRAW_DEBOUNCE_MS = 150
+    # 通道搜索输入的防抖间隔（毫秒）
+    SEARCH_DEBOUNCE_MS = 250
+    # 判定“点中竖直线”的容差（占 X 轴范围的比例）
+    NEAR_LINE_TOLERANCE = 0.01
+    # 最近采样点与目标时刻的最大允许偏差（秒），超出则不显示瞬时值
+    NEAREST_POINT_TOLERANCE = 0.1
+    # 有效值窗口内无数据时使用的默认窗口（秒）
+    DEFAULT_EFFECTIVE_WINDOW = 10.0
+    # 坐标轴/图例/标注字号
+    FONT_AXIS_LABEL = 9
+    FONT_LEGEND = 8
+    FONT_ANNOTATION = 8
+    # 关键字过滤：DataManager 属性名 → 命中即排除的关键字
+    KEYWORD_FILTERS = OrderedDict([
+        ('skip_fault_params', '故障'),
+        ('skip_reserve_params', '保留'),
+        ('skip_predefined_params', '预留'),
+        ('skip_standby_params', '备用'),
+        ('skip_idle_params', '空闲'),
+        ('skip_delete_params', '删除'),
+    ])
+    # 支持的 Excel 扩展名
+    EXCEL_EXTENSIONS = ('.xls', '.xlsx')
+
     EFFECTIVE_VALUE_METHODS = OrderedDict([
         ("瞬时值", 0.0),
         ("前后1秒平均值", 1.0),
@@ -284,7 +351,12 @@ class DataManager:
         self.tdms_files = {}
         self.file_paths = {}
         self.xls_time_axis = {}  # xls文件: (file, group) → 采样时刻数组（秒）
-        self._data_cache = {}
+        # LRU 缓存：最多保留 CACHE_MAX_ITEMS 条通道数据，避免长时间浏览后内存膨胀
+        self._data_cache = OrderedDict()
+        # Excel 通道数据在导入时即全部读入内存，单独存放，不参与 LRU 淘汰
+        self._excel_data = {}
+        # 加载过程中产生的提示/错误信息（供主线程展示，工作线程内不得直接弹窗）
+        self._last_messages = []
         self.sample_time = Config.DEFAULT_SAMPLE_TIME
         self.effective_value_method = "前后10秒平均值"
         self.effective_value_window = 10.0
@@ -301,6 +373,41 @@ class DataManager:
         self._cancel_load = False
         self._last_excluded_count = 0
         self._last_load_error = None
+
+    # ------------------------------------------------------------------
+    # 缓存 / 消息
+    # ------------------------------------------------------------------
+    def _put_cache(self, key, data):
+        """写入通道数据缓存并按 LRU 淘汰最久未使用的条目"""
+        self._data_cache[key] = data
+        self._data_cache.move_to_end(key)
+        while len(self._data_cache) > Config.CACHE_MAX_ITEMS:
+            self._data_cache.popitem(last=False)
+
+    def _add_message(self, level, text):
+        """记录一条待展示消息（工作线程安全，不触碰任何 QWidget）"""
+        self._last_messages.append((level, text))
+        if level == 'error':
+            logger.error(text)
+        else:
+            logger.info(text)
+
+    def take_messages(self):
+        """取出并清空待展示消息（主线程调用）"""
+        messages, self._last_messages = self._last_messages, []
+        return messages
+
+    def close_tdms_file(self, file_name):
+        """关闭并释放 TDMS 文件句柄（Windows 上避免文件被占用无法删除）"""
+        tdms_file = self.tdms_files.pop(file_name, None)
+        if tdms_file is None:
+            return
+        try:
+            closer = getattr(tdms_file, 'close', None)
+            if callable(closer):
+                closer()
+        except Exception as e:
+            logger.warning("关闭 TDMS 文件失败 %s: %s", file_name, e)
 
     def load_tdms_file(self, file_path, progress_callback=None, parent_window=None):
         file_name = osp.basename(file_path)
@@ -319,12 +426,30 @@ class DataManager:
                 return self._process_tdms_data(tdms_file, file_name, progress_callback, parent_window)
             except Exception as e_backup:
                 self._last_load_error = (file_name, f"{type(e).__name__}: {str(e_backup)}")
-                print(f"加载失败: {file_name}: {e_backup}")
+                logger.exception("加载 TDMS 失败: %s", file_name)
             if file_name in self.files_data:
                 del self.files_data[file_name]
-            if file_name in self.tdms_files:
-                del self.tdms_files[file_name]
+            self.close_tdms_file(file_name)
             return False
+
+    @staticmethod
+    def is_excel_path(file_path):
+        return str(file_path or '').lower().endswith(Config.EXCEL_EXTENSIONS)
+
+    def load_file_by_ext(self, file_path, parent_window=None):
+        """按扩展名分派加载（TDMS / Excel 统一入口）。
+
+        以前「重新加载」只走 TDMS 分支，导致已导入的 Excel 文件被静默丢弃。
+        """
+        if not file_path:
+            return False
+        lower_path = str(file_path).lower()
+        if lower_path.endswith(Config.EXCEL_EXTENSIONS):
+            return self.load_excel_file(file_path)
+        if lower_path.endswith('.tdms'):
+            return self.load_tdms_file(file_path, parent_window=parent_window)
+        self._add_message('error', f"不支持的文件类型: {osp.basename(file_path)}")
+        return False
 
     def load_tdms_file_with_progress(self, file_path, parent_window, on_finish_callback=None):
         """启动带进度条的异步文件加载（SignalBridge 跨线程通信）"""
@@ -411,41 +536,44 @@ class DataManager:
     def unload_file(self, file_name):
         if file_name in self.files_data:
             del self.files_data[file_name]
-        if file_name in self.tdms_files:
-            del self.tdms_files[file_name]
+        self.close_tdms_file(file_name)
         if file_name in self.file_paths:
             del self.file_paths[file_name]
         for k in [k for k in self.xls_time_axis if k[0] == file_name]:
             del self.xls_time_axis[k]
-        keys_to_remove = [k for k in self._data_cache if k[0] == file_name]
-        for k in keys_to_remove:
-            del self._data_cache[k]
+        for store in (self._data_cache, self._excel_data):
+            for k in [k for k in store if k[0] == file_name]:
+                del store[k]
 
     def get_channel_data(self, file_name, group_name, channel_name):
         cache_key = (file_name, group_name, channel_name)
-        if cache_key in self._data_cache:
-            return self._data_cache[cache_key]
+        excel_cached = self._excel_data.get(cache_key)
+        if excel_cached is not None:
+            return excel_cached
+        cached = self._data_cache.get(cache_key)
+        if cached is not None:
+            self._data_cache.move_to_end(cache_key)
+            return cached
         try:
             channel = self.files_data[file_name][group_name][channel_name]
+            # Excel 通道以 True 占位（数据已在缓存中），此时无数据可读
+            if channel is True:
+                return None
             data = np.asarray(channel[:])
-            self._data_cache[cache_key] = data
-            return data
         except KeyError:
             return None
+        except Exception as e:
+            # 文件句柄失效/数据类型异常等，不能让异常穿透到重绘链路
+            logger.warning("读取通道数据失败 %s/%s/%s: %s",
+                           file_name, group_name, channel_name, e)
+            return None
+        self._put_cache(cache_key, data)
+        return data
 
     def should_exclude_channel(self, channel_name, data=None):
-        if self.skip_fault_params and '故障' in channel_name:
-            return True
-        if self.skip_reserve_params and '保留' in channel_name:
-            return True
-        if self.skip_predefined_params and '预留' in channel_name:
-            return True
-        if self.skip_standby_params and '备用' in channel_name:
-            return True
-        if self.skip_idle_params and '空闲' in channel_name:
-            return True
-        if self.skip_delete_params and '删除' in channel_name:
-            return True
+        for attr_name, keyword in Config.KEYWORD_FILTERS.items():
+            if getattr(self, attr_name, True) and keyword in channel_name:
+                return True
         if not self.filter_enabled:
             return False
         for pattern in self.exclude_patterns:
@@ -466,14 +594,32 @@ class DataManager:
     # ------------------------------------------------------------------
     # Excel (.xls) 试验数据读取
     # ------------------------------------------------------------------
+    # 严格匹配 H:MM:SS(.sss)，以 $ 锚定，避免把非法后缀静默截断成合法时间
+    _HMS_RE = re.compile(r'^(\d{1,3}):(\d{1,2})(?::(\d{1,2}(?:\.\d+)?))?$')
+
+    @staticmethod
+    def _to_monotonic_seconds(t_arr):
+        """把“当日秒数”序列转成相对首个采样点的秒数。
+
+        试验跨零点时（23:59:59 → 00:00:01）秒数会回退，直接相减会得到巨大
+        负数并使横轴反向；此处按天续接，保证时间轴单调递增。
+        """
+        arr = np.asarray(t_arr, dtype=float)
+        if arr.size == 0:
+            return arr
+        if arr.size == 1:
+            return arr - arr[0]
+        day_offset = np.cumsum(np.diff(arr) < 0) * 86400.0
+        return arr - arr[0] + np.concatenate(([0.0], day_offset))
+
     @staticmethod
     def _parse_hms_to_seconds(value):
         """将采样时刻解析为秒：支持 'H:MM:SS'/'HH:MM:SS' 文本及 Excel 时间小数。"""
         if isinstance(value, str):
             s = value.strip()
-            m = re.match(r'^(\d{1,3}):(\d{1,2})(?::(\d{1,2}))?', s)
+            m = DataManager._HMS_RE.match(s)
             if m:
-                h, mi, se = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+                h, mi, se = int(m.group(1)), int(m.group(2)), float(m.group(3) or 0)
                 return h * 3600.0 + mi * 60.0 + se
             try:
                 return float(s)
@@ -499,20 +645,21 @@ class DataManager:
         """
         file_name = osp.basename(file_path)
         if file_name in self.files_data:
-            QMessageBox.information(None, "提示", f"文件 '{file_name}' 已经打开！")
+            self._add_message('info', f"文件 '{file_name}' 已经打开！")
             return False
         try:
             from python_calamine import CalamineWorkbook
         except ImportError:
-            QMessageBox.critical(None, "缺少依赖",
-                                 "读取 Excel 文件需要 python-calamine 库，请先安装:\n\npip install python-calamine")
+            # 工作线程中禁止创建 QWidget，统一改为消息收集
+            self._add_message('error',
+                              "读取 Excel 文件需要 python-calamine 库，请先安装:\n\npip install python-calamine")
             return False
         try:
             wb = CalamineWorkbook.from_path(file_path)
             rows = wb.get_sheet_by_index(0).to_python()
         except Exception as e:
-            QMessageBox.critical(None, "文件加载错误",
-                                 f"打开文件失败: {file_name}\n\n{type(e).__name__}: {str(e)}")
+            self._add_message('error',
+                              f"打开文件失败: {file_name}\n\n{type(e).__name__}: {str(e)}")
             return False
 
         nrows = len(rows)
@@ -545,8 +692,7 @@ class DataManager:
         第1行日期单元格转成字符串（不同库对日期的表示不同）。
         """
         if nrows < 6 or ncols < 2:
-            QMessageBox.critical(None, "文件加载错误",
-                                 f"文件格式不正确（数据行不足）: {file_name}")
+            self._add_message('error', f"文件格式不正确（数据行不足）: {file_name}")
             return False
 
         # 试验日期（第1行）作为组名的一部分
@@ -556,19 +702,22 @@ class DataManager:
             date_str = ""
         group_name = f"试验数据({date_str})" if date_str else "试验数据"
 
-        # 解析采样时刻（第6行及以下，第1列）
+        # 解析采样时刻（第6行及以下，第1列）。
+        # 只解析一次并缓存有效行索引：原先每列都重扫一遍（含正则匹配），
+        # 列数多时是 O(行×列) 的隐性耗时。
         t_seconds = []
+        valid_rows = []
         for r in range(5, nrows):
             t = self._parse_hms_to_seconds(cell_value(r, 0))
             if t is None:
                 continue
             t_seconds.append(t)
+            valid_rows.append(r)
         if not t_seconds:
-            QMessageBox.critical(None, "文件加载错误",
-                                 f"未解析到有效的采样时刻数据: {file_name}")
+            self._add_message('error', f"未解析到有效的采样时刻数据: {file_name}")
             return False
         t_arr = np.asarray(t_seconds, dtype=float)
-        time_axis = t_arr - t_arr[0]  # 相对首个采样点的秒数
+        time_axis = self._to_monotonic_seconds(t_arr)  # 跨零点按天续接，保证递增
         n_points = len(t_arr)
 
         # 解析参数名称（第4行变量名称，缺失时回退第3行变量编号）
@@ -598,12 +747,9 @@ class DataManager:
                 suffix += 1
             used_names.add(name)
 
-            # 读取实测数据（数据行与采样时刻行数对齐）
+            # 读取实测数据（复用已解析的有效行索引）
             values = []
-            for r in range(5, nrows):
-                t = self._parse_hms_to_seconds(cell_value(r, 0))
-                if t is None:
-                    continue
+            for r in valid_rows:
                 try:
                     v = float(cell_value(r, col))
                 except (TypeError, ValueError):
@@ -613,33 +759,36 @@ class DataManager:
                 continue
             data = np.asarray(values[:n_points], dtype=float)
 
-            self.files_data[file_name][group_name][name] = True  # 占位，数据在缓存中
-            self._data_cache[(file_name, group_name, name)] = data
+            self.files_data[file_name][group_name][name] = True  # 占位，数据在常驻表中
+            self._excel_data[(file_name, group_name, name)] = data
             loaded += 1
 
         if excluded > 0:
-            QMessageBox.information(None, "筛选信息",
-                                    f"已排除 {excluded} 个参数（命中导入过滤规则）")
+            self._add_message('info', f"已排除 {excluded} 个参数（命中导入过滤规则）")
         if loaded == 0:
             del self.files_data[file_name]
             self.xls_time_axis.pop((file_name, group_name), None)
-            QMessageBox.critical(None, "文件加载错误",
-                                 f"未从文件中读取到有效参数: {file_name}")
+            self._add_message('error', f"未从文件中读取到有效参数: {file_name}")
             return False
         return True
 
     def clear(self):
+        for file_name in list(self.tdms_files.keys()):
+            self.close_tdms_file(file_name)
         self.files_data.clear()
         self.tdms_files.clear()
         self.file_paths.clear()
         self.xls_time_axis.clear()
         self._data_cache.clear()
+        self._excel_data.clear()
+        self._last_messages = []
         gc.collect()
 
     def _process_tdms_data(self, tdms_file, file_name, progress_callback, parent_window=None):
         try:
             total_channels = sum(len(group.channels()) for group in tdms_file.groups())
-        except Exception:
+        except Exception as e:
+            logger.warning("统计 TDMS 通道数失败: %s", e)
             total_channels = 0
         loaded_channels = 0
         excluded_count = 0
@@ -1489,6 +1638,15 @@ class MatplotlibPlotPanel(QWidget):
         self.crosshair_h = None
         self.crosshair_text = None
 
+        # 降采样结果缓存：数据未变化时避免每次重绘重复计算
+        self._downsample_cache = OrderedDict()
+        # 各通道绘制数据的数值范围（全量口径，供 Y 轴自动缩放使用）
+        self._plot_y_limits = {}
+        # 拖拽过程中的合并刷新定时器（避免每个鼠标事件都做全量统计）
+        self._drag_timer = QTimer(self)
+        self._drag_timer.setSingleShot(True)
+        self._drag_timer.timeout.connect(self._flush_drag_update)
+
         self._create_ui()
         self._setup_event_bindings()
 
@@ -1596,11 +1754,17 @@ class MatplotlibPlotPanel(QWidget):
         if top_channels is None:
             top_channels = set()
 
+        # 空通道直接跳过：否则后续 np.min 会因空数组抛 ValueError
+        plots_data = [pd for pd in plots_data
+                      if pd.get('y_data') is not None and len(pd['y_data']) > 0]
         self._clear_plot()
+        if not plots_data:
+            self._finalize_plot()
+            return
 
         if len(plots_data) == 1:
             y_raw = plots_data[0]['y_data']
-            if np.min(y_raw) == np.max(y_raw) and plots_data[0]['name'] not in show_actual_value_channels:
+            if len(y_raw) and np.min(y_raw) == np.max(y_raw) and plots_data[0]['name'] not in show_actual_value_channels:
                 show_actual_value_channels.add(plots_data[0]['name'])
 
         self._prepare_plot_data(plots_data, parameters, show_actual_value_channels, top_channels)
@@ -1609,7 +1773,9 @@ class MatplotlibPlotPanel(QWidget):
         for right_ax in self.right_axes_dict.values():
             right_ax.set_xlim(0, self.x_max)
         self._auto_scale_y()
-        self._update_vertical_lines()
+        # 竖直线与录取线只修改 artist，最后由 _finalize_plot 统一绘制一次
+        self._update_vertical_lines(draw=False, sync_record_lines=False)
+        self._update_record_lines()
         self._finalize_plot()
 
     def _clear_plot(self):
@@ -1626,6 +1792,8 @@ class MatplotlibPlotPanel(QWidget):
         self.blue_shadow = None
         # 重置数据录取线artist引用（axes.clear() 已删除原对象，录取线位置保留）
         self.record_artists = []
+        self._downsample_cache.clear()
+        self._plot_y_limits.clear()
 
     def _prepare_plot_data(self, plots_data, parameters, show_actual_value_channels, top_channels):
         max_x = max((np.max(pd['x_data']) for pd in plots_data if len(pd['x_data']) > 0),
@@ -1639,6 +1807,8 @@ class MatplotlibPlotPanel(QWidget):
         normal_plots, top_plots = [], []
         for plot_data in plots_data:
             plot_info = self._create_plot_info(plot_data, parameters, show_actual_value_channels, top_channels)
+            if plot_info is None:  # 空通道
+                continue
             if plot_info['is_top']:
                 top_plots.append(plot_info)
             else:
@@ -1646,7 +1816,10 @@ class MatplotlibPlotPanel(QWidget):
         self._draw_plots(normal_plots + top_plots, parameters, show_actual_value_channels)
 
     @staticmethod
-    def _downsample(x, y, threshold=4000):
+    def _downsample(x, y, threshold=None):
+        """LTTB 降采样：保持波形特征的同时把点数压到 threshold"""
+        if threshold is None:
+            threshold = Config.DOWNSAMPLE_THRESHOLD
         n = len(x)
         if n <= threshold:
             return x, y
@@ -1659,10 +1832,12 @@ class MatplotlibPlotPanel(QWidget):
         for i in range(threshold - 2):
             s = int(np.floor(i * bucket_size) + 1)
             e = int(np.floor((i + 1) * bucket_size) + 1)
-            e = min(e, n - 1)
+            e = min(max(e, s + 1), n - 1)
             ns = int(np.floor((i + 1) * bucket_size) + 1)
             ne = int(np.floor((i + 2) * bucket_size) + 1)
-            ne = min(ne, n)
+            # 空切片的 mean 会返回 NaN，进而使 area 全 NaN、argmax 恒为 0，
+            # 导致降采样结果静默失真；这里强制切片至少含一个点。
+            ne = min(max(ne, ns + 1), n)
             avg_x = x[ns:ne].mean()
             avg_y = y[ns:ne].mean()
             ax, ay = x[a], y[a]
@@ -1671,6 +1846,26 @@ class MatplotlibPlotPanel(QWidget):
             out_x[i + 1] = x[a]
             out_y[i + 1] = y[a]
         return out_x, out_y
+
+    def _downsample_for(self, x, y, threshold=None):
+        """带缓存的降采样：同一份数据在多次重绘之间复用结果
+
+        原先每次重绘（改线宽、勾选、缩放）都要对全部通道重跑一遍 O(n) 计算，
+        数据本身没变化时属于纯浪费。
+        """
+        if threshold is None:
+            threshold = Config.DOWNSAMPLE_THRESHOLD
+        if len(x) <= threshold:
+            return x, y
+        key = (id(x), id(y), len(x), threshold)
+        cached = self._downsample_cache.get(key)
+        if cached is not None:
+            return cached
+        result = self._downsample(x, y, threshold)
+        self._downsample_cache[key] = result
+        while len(self._downsample_cache) > 64:
+            self._downsample_cache.popitem(last=False)
+        return result
 
     def _create_plot_info(self, plot_data, parameters, show_actual_value_channels, top_channels):
         name = plot_data['name']
@@ -1683,13 +1878,26 @@ class MatplotlibPlotPanel(QWidget):
         legend_name = param.get('legend_name', simple_name)
         show_actual = name in show_actual_value_channels
         is_top = name in top_channels
-        y_data = plot_data['y_data']
-        y_min, y_max = np.min(y_data), np.max(y_data)
-        if self._is_percent_mode() and not show_actual:
-            if y_max != y_min:
-                y_data = (y_data - y_min) / (y_max - y_min) * 100
-            else:
-                y_data = np.full_like(y_data, 100.0)
+        y_raw = plot_data['y_data']
+        if len(y_raw) == 0:
+            return None
+        # 先剔除 NaN/inf，避免极值计算被污染（全 NaN 时退化为 0~1）
+        finite = np.isfinite(y_raw)
+        if np.any(finite):
+            y_min, y_max = float(np.min(y_raw[finite])), float(np.max(y_raw[finite]))
+        else:
+            y_min, y_max = 0.0, 1.0
+        is_constant = (y_max == y_min)
+        # 逐通道决定量纲：勾选「显示实际值」的用真实值（画在右轴），
+        # 其余始终归一化到 0~100，避免一个通道的勾选影响其他通道。
+        if show_actual:
+            y_data = y_raw
+        elif is_constant:
+            y_data = np.full_like(y_raw, 100.0)
+        else:
+            y_data = (y_raw - y_min) / (y_max - y_min) * 100
+        # 记录绘制数据的真实范围（全量口径），供 _auto_scale_y 使用
+        self._plot_y_limits[name] = (float(np.min(y_data)), float(np.max(y_data)))
         return {
             'x_data': plot_data['x_data'], 'y_data': y_data, 'name': name,
             'display_name': simple_name, 'legend_name': legend_name,
@@ -1700,16 +1908,17 @@ class MatplotlibPlotPanel(QWidget):
 
     def _draw_plots(self, plots, parameters, show_actual_value_channels):
         for plot_info in plots:
-            if not plot_info['show_actual'] or self._is_percent_mode():
+            if not plot_info['show_actual']:
                 line = self._draw_single_plot(plot_info)
                 if line:
                     self.current_plots[plot_info['name']] = line
         self._create_right_axes(parameters, show_actual_value_channels)
 
     def _create_right_axes(self, parameters, show_actual_value_channels):
+        # 勾选「显示实际值」的通道独立使用右侧 Y 轴，其余通道仍走百分比左轴
         actual_value_channels = [
             name for name in parameters.keys()
-            if name in show_actual_value_channels and not self._is_percent_mode()
+            if name in show_actual_value_channels
         ]
         for i, channel_name in enumerate(actual_value_channels):
             if channel_name not in self.original_data:
@@ -1739,18 +1948,15 @@ class MatplotlibPlotPanel(QWidget):
         zorder = 10 if is_top else 1
         simple_name = self._extract_simple_name(channel_name)
         legend_name = param.get('legend_name', simple_name)
-        label_parts = [legend_name]
-        if not self._is_percent_mode():
-            label_parts.append("实际值")
-        label = " ".join(label_parts)
-        line, = right_ax.plot(*self._downsample(channel_data['x'], channel_data['y']),
+        label = f"{legend_name} 实际值"
+        line, = right_ax.plot(*self._downsample_for(channel_data['x'], channel_data['y']),
                               label=label, color=color, linestyle=linestyle,
                               linewidth=linewidth, zorder=zorder)
         self.current_plots[channel_name] = line
 
     def _draw_single_plot(self, plot_info):
         zorder = 10 if plot_info['is_top'] else 1
-        x_data, y_data = self._downsample(plot_info['x_data'], plot_info['y_data'])
+        x_data, y_data = self._downsample_for(plot_info['x_data'], plot_info['y_data'])
         line, = self.axes.plot(
             x_data, y_data,
             label=f"{plot_info['legend_name']}",
@@ -1760,13 +1966,16 @@ class MatplotlibPlotPanel(QWidget):
         return line
 
     def _setup_plot_appearance(self):
-        self.axes.set_xlabel('时间 (s)', fontsize=9)
-        self.axes.set_ylabel('百分比 (%)' if self._is_percent_mode() else '数值', fontsize=9)
+        self.axes.set_xlabel('时间 (s)', fontsize=Config.FONT_AXIS_LABEL)
+        percent_channels = [n for n in self.current_plots if n not in self.right_axes_dict]
+        self.axes.set_ylabel('百分比 (%)' if percent_channels else '数值',
+                             fontsize=Config.FONT_AXIS_LABEL)
         self.axes.grid(True, alpha=0.3)
         if self.current_plots:
             lines = list(self.current_plots.values())
             labels = [line.get_label() for line in lines]
-            legend = self.axes.legend(lines, labels, loc='upper right', fontsize=8)
+            legend = self.axes.legend(lines, labels, loc='upper right',
+                                      fontsize=Config.FONT_LEGEND)
             for leg_line in legend.get_lines():
                 leg_line.set_linewidth(1.0)
         if self.span_selector:
@@ -1778,9 +1987,8 @@ class MatplotlibPlotPanel(QWidget):
         self.figure.tight_layout(pad=1.0)
         self.canvas.draw()
 
-    def _is_percent_mode(self):
-        main_frame = self.window()
-        return not bool(getattr(main_frame.param_panel, 'show_actual_value_channels', set()))
+    # 最近采样点查找：模块级 nearest_index 的类内别名
+    _nearest_index = staticmethod(nearest_index)
 
     def _extract_simple_name(self, display_name):
         return display_name.split('|')[1] if '|' in display_name else display_name
@@ -1793,6 +2001,7 @@ class MatplotlibPlotPanel(QWidget):
                 self.axes.set_xlim(0, self.x_max)
                 for right_ax in self.right_axes_dict.values():
                     right_ax.set_xlim(0, self.x_max)
+                self._refresh_record_annotations()
                 self.canvas.draw()
                 self._update_zoom_status(0, self.x_max, is_duration_change=True)
         except (ValueError, TypeError):
@@ -1807,6 +2016,7 @@ class MatplotlibPlotPanel(QWidget):
         self.axes.set_xlim(xmin, xmax)
         for right_ax in self.right_axes_dict.values():
             right_ax.set_xlim(xmin, xmax)
+        self._refresh_record_annotations()
         self.canvas.draw()
         self._update_zoom_status(xmin, xmax)
 
@@ -1845,7 +2055,11 @@ class MatplotlibPlotPanel(QWidget):
                 self.red_line_x = event.xdata
             elif self.dragging == 'blue':
                 self.blue_line_x = event.xdata
-            self._update_vertical_lines()
+            # 拖拽期间只重画竖直线；参数表格统计合并到定时器中刷新，
+            # 避免每个鼠标事件都对全部通道做一次全量扫描。
+            self._update_vertical_lines(draw=True, sync_record_lines=False,
+                                        update_table=False)
+            self._drag_timer.start(Config.DRAG_UPDATE_INTERVAL_MS)
             self._hide_crosshair()
             return
 
@@ -1853,7 +2067,10 @@ class MatplotlibPlotPanel(QWidget):
         if self.dragging_record is not None:
             if 0 <= self.dragging_record < len(self.record_lines):
                 self.record_lines[self.dragging_record]['x'] = event.xdata
-                self._update_record_lines()
+                # 只更新线的位置，数值标注等定时器到期后一次性计算
+                self._update_record_lines(with_values=False)
+                self.canvas.draw_idle()
+                self._drag_timer.start(Config.DRAG_UPDATE_INTERVAL_MS)
             self._hide_crosshair()
             return
 
@@ -1894,10 +2111,16 @@ class MatplotlibPlotPanel(QWidget):
             if self.span_selector:
                 self.span_selector.set_active(True)
             self.dragging = None
+            self._drag_timer.stop()
+            # 松手时补一次完整刷新（含参数表格统计）
+            self._update_vertical_lines(draw=True, sync_record_lines=False, update_table=True)
         if self.dragging_record is not None:
             if self.span_selector:
                 self.span_selector.set_active(True)
             self.dragging_record = None
+            self._drag_timer.stop()
+            self._update_record_lines(with_values=True)
+            self.canvas.draw_idle()
 
     def _on_navigation(self, event):
         if hasattr(event, 'dblclick') and event.dblclick and event.inaxes == self.axes:
@@ -1918,6 +2141,7 @@ class MatplotlibPlotPanel(QWidget):
         new_y_min = y_center - new_range * ratio
         new_y_max = y_center + new_range * (1 - ratio)
         target_ax.set_ylim(new_y_min, new_y_max)
+        self._refresh_record_annotations()
         self.canvas.draw_idle()
         main_frame = self.window()
         if hasattr(main_frame, 'status_bar'):
@@ -1938,7 +2162,13 @@ class MatplotlibPlotPanel(QWidget):
             self.blue_line_x = x_range[0] + (x_range[1] - x_range[0]) * 0.7
         self._update_vertical_lines()
 
-    def _update_vertical_lines(self):
+    def _update_vertical_lines(self, draw=True, sync_record_lines=True, update_table=True):
+        """刷新红/蓝竖直线、阴影与时刻标注。
+
+        draw                是否立即重绘（批量绘制时由调用方统一 draw，避免重复渲染）
+        sync_record_lines   是否同步重算录取线标注（拖拽过程中无需重算）
+        update_table        是否刷新参数表格统计（拖拽期间由节流定时器合并刷新）
+        """
         for obj in [self.red_line, self.blue_line,
                     getattr(self, 'red_time_text', None),
                     getattr(self, 'blue_time_text', None),
@@ -1946,8 +2176,8 @@ class MatplotlibPlotPanel(QWidget):
             if obj and hasattr(obj, 'remove'):
                 try:
                     obj.remove()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("移除竖直线 artist 失败: %s", e)
         self.red_line = self.blue_line = None
         self.red_time_text = self.blue_time_text = None
         self.red_shadow = self.blue_shadow = None
@@ -1984,14 +2214,30 @@ class MatplotlibPlotPanel(QWidget):
                 f"{self.blue_line_x:.3f}s", color='blue', fontsize=8,
                 ha='left', va='bottom', fontweight='bold', zorder=11)
 
-        self.on_vertical_lines_changed(self.red_line_x, self.blue_line_x)
+        if update_table:
+            self.on_vertical_lines_changed(self.red_line_x, self.blue_line_x)
         # 同步刷新数据录取线位置（随坐标范围变化重新定位标注）
-        self._update_record_lines()
-        self.canvas.draw()
+        if sync_record_lines:
+            self._update_record_lines()
+        if draw:
+            self.canvas.draw()
 
     # ------------------------------------------------------------------
     # 数据录取竖直线（紫色）
     # ------------------------------------------------------------------
+    def _refresh_record_annotations(self):
+        """坐标范围变化后重新定位录取线标注（缩放/复原/框选）"""
+        if self.record_lines:
+            self._update_record_lines(with_values=True)
+
+    def _flush_drag_update(self):
+        """拖拽/连续交互的合并刷新：定时器到期或鼠标释放时执行一次完整更新"""
+        if self.dragging:
+            self._update_vertical_lines(draw=True, sync_record_lines=False, update_table=True)
+        elif self.dragging_record is not None:
+            self._update_record_lines(with_values=True)
+            self.canvas.draw_idle()
+
     def _on_add_record_line(self):
         """添加数据录取竖直线"""
         if not self.current_plots:
@@ -2003,13 +2249,17 @@ class MatplotlibPlotPanel(QWidget):
         self._update_record_lines()
         self.canvas.draw()
 
-    def _update_record_lines(self):
-        """绘制/刷新所有数据录取竖直线及其有效值标注"""
+    def _update_record_lines(self, with_values=True):
+        """绘制/刷新所有数据录取竖直线及其有效值标注
+
+        with_values=False 时只画线与时刻文本，跳过逐通道的有效值计算
+        （拖拽过程中使用，避免每个鼠标事件都做全量扫描）。
+        """
         for artist in self.record_artists:
             try:
                 artist.remove()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("移除录取线 artist 失败: %s", e)
         self.record_artists = []
 
         if not self.record_lines:
@@ -2038,20 +2288,29 @@ class MatplotlibPlotPanel(QWidget):
             self.record_artists.append(time_text)
 
             # 每条参数曲线在该时刻的有效值标注（交点右上方，颜色与曲线一致）
+            # 拖拽过程中先跳过，由 _flush_drag_update 合并计算
+            if not with_values:
+                continue
             for name, plot_line in self.current_plots.items():
                 data = self.original_data.get(name)
                 if data is None or len(data['x']) == 0:
                     continue
                 xd, yd = data['x'], data['y']
-                idx = int(np.argmin(np.abs(xd - x)))
+                idx = self._nearest_index(xd, x)
+                if idx < 0:
+                    continue
                 y_raw = float(yd[idx])
-                # 百分比模式下曲线按各自量程归一化到 0~100，标注必须使用同一
-                # 归一化坐标，否则会偏离曲线甚至超出坐标轴被裁剪而“看不见”
-                if self._is_percent_mode():
-                    ymn, ymx = float(np.min(yd)), float(np.max(yd))
-                    y_pos = ((y_raw - ymn) / (ymx - ymn) * 100.0) if ymx != ymn else 100.0
-                else:
+                # 归一化通道的曲线按各自量程缩放到 0~100，标注必须使用同一
+                # 归一化坐标，否则会偏离曲线甚至超出坐标轴被裁剪而“看不见”；
+                # 显示实际值的通道走右侧独立坐标轴，用原始值即可。
+                if name in self.right_axes_dict:
                     y_pos = y_raw
+                else:
+                    ymn, ymx = float(np.nanmin(yd)), float(np.nanmax(yd))
+                    if np.isfinite(ymn) and np.isfinite(ymx) and ymx != ymn:
+                        y_pos = (y_raw - ymn) / (ymx - ymn) * 100.0
+                    else:
+                        y_pos = 100.0
                 # 界面标注只显示两位小数（CSV 导出仍保留 6 位精度）
                 eff = self._calc_effective_value(name, x, window_size, decimals=2)
                 if eff is None:
@@ -2077,11 +2336,19 @@ class MatplotlibPlotPanel(QWidget):
                                   'effective_value_window', 10.0)
         x, y = data['x'], data['y']
         if window_size == 0.0:  # 瞬时值
-            idx = int(np.argmin(np.abs(x - line_x)))
-            if abs(x[idx] - line_x) < 0.1:
-                return f"{y[idx]:.{decimals}f}"
-            return None
-        mask = (x >= line_x - window_size) & (x <= line_x + window_size)
+            idx = nearest_index(x, line_x)
+            if idx < 0 or abs(x[idx] - line_x) >= Config.NEAREST_POINT_TOLERANCE:
+                return None
+            return f"{y[idx]:.{decimals}f}"
+        lo, hi = line_x - window_size, line_x + window_size
+        if len(x) and x[0] <= x[-1]:
+            # 升序时用切片取窗口，避免每次都构造全长度布尔掩码
+            i0 = int(np.searchsorted(x, lo, side='left'))
+            i1 = int(np.searchsorted(x, hi, side='right'))
+            if i1 <= i0:
+                return None
+            return f"{np.mean(y[i0:i1]):.{decimals}f}"
+        mask = (x >= lo) & (x <= hi)
         if not np.any(mask):
             return None
         return f"{np.mean(y[mask]):.{decimals}f}"
@@ -2112,6 +2379,7 @@ class MatplotlibPlotPanel(QWidget):
             for right_ax in self.right_axes_dict.values():
                 right_ax.set_xlim(0, self.x_max)
             self._auto_scale_y()
+            self._refresh_record_annotations()
             self.canvas.draw()
             self._update_zoom_status(0, self.x_max, is_reset=True)
         except Exception:
@@ -2126,11 +2394,19 @@ class MatplotlibPlotPanel(QWidget):
             return
         y_min, y_max = float('inf'), float('-inf')
         for name, line in self.current_plots.items():
-            if name not in self.right_axes_dict:
+            if name in self.right_axes_dict:
+                continue
+            # 优先使用全量口径的数值范围（_plot_y_limits 在 _create_plot_info 中记录），
+            # 避免降采样丢掉尖峰导致左右轴缩放范围不一致
+            limits = self._plot_y_limits.get(name)
+            if limits is None:
                 ydata = line.get_ydata()
-                if len(ydata) > 0:
-                    y_min = min(y_min, float(np.min(ydata)))
-                    y_max = max(y_max, float(np.max(ydata)))
+                if len(ydata) == 0:
+                    continue
+                limits = (float(np.nanmin(ydata)), float(np.nanmax(ydata)))
+            if np.isfinite(limits[0]) and np.isfinite(limits[1]):
+                y_min = min(y_min, limits[0])
+                y_max = max(y_max, limits[1])
         if y_min != float('inf'):
             if abs(y_max - y_min) < 1e-10:
                 y_min, y_max = y_min - 0.1, y_max + 0.1
@@ -2141,7 +2417,12 @@ class MatplotlibPlotPanel(QWidget):
         for channel_name, right_ax in self.right_axes_dict.items():
             if channel_name in self.original_data:
                 y_data = self.original_data[channel_name]['y']
-                y_min, y_max = np.min(y_data), np.max(y_data)
+                if len(y_data) == 0:
+                    continue
+                finite = np.isfinite(y_data)
+                if not np.any(finite):
+                    continue
+                y_min, y_max = float(np.min(y_data[finite])), float(np.max(y_data[finite]))
                 if abs(y_max - y_min) < 1e-10:
                     y_min, y_max = y_min - 0.1, y_max + 0.1
                 else:
@@ -2897,57 +3178,41 @@ class ParameterGridPanel(QWidget):
             self._show_linewidth_popup(row, col)
 
     def _show_color_popup(self, row, col):
-        item = self.grid.item(row, col)
-        if not item:
-            return
-        popup = ColorPopupWidget(self.grid, Config.COLOR_PALETTE)
-
-        def on_select(hex_code):
-            self._suppress_redraw = True
-            item.setText(hex_code)
-            self._suppress_redraw = False
-            if self.on_parameter_changed:
-                self.on_parameter_changed()
-
-        popup.color_selected.connect(on_select)
-        rect = self.grid.visualRect(self.grid.model().index(row, col))
-        pos = self.grid.viewport().mapToGlobal(rect.center())
-        popup.move(pos.x() - popup.width() // 2, pos.y() + rect.height() // 2 + 4)
-        popup.show()
+        self._show_cell_popup(row, col,
+                              ColorPopupWidget(self.grid, Config.COLOR_PALETTE),
+                              'color_selected',
+                              lambda hex_code: self._apply_cell_text(row, col, hex_code))
 
     def _show_linestyle_popup(self, row, col):
-        item = self.grid.item(row, col)
-        if not item:
-            return
-        popup = LineStylePopupWidget(self.grid)
-
-        def on_select(style_name):
-            self._suppress_redraw = True
-            item.setText(style_name)
-            self._suppress_redraw = False
-            if self.on_parameter_changed:
-                self.on_parameter_changed()
-
-        popup.style_selected.connect(on_select)
-        rect = self.grid.visualRect(self.grid.model().index(row, col))
-        pos = self.grid.viewport().mapToGlobal(rect.center())
-        popup.move(pos.x() - popup.width() // 2, pos.y() + rect.height() // 2 + 4)
-        popup.show()
+        self._show_cell_popup(row, col,
+                              LineStylePopupWidget(self.grid),
+                              'style_selected',
+                              lambda style_name: self._apply_cell_text(row, col, style_name))
 
     def _show_linewidth_popup(self, row, col):
+        self._show_cell_popup(row, col,
+                              LineWidthPopupWidget(self.grid),
+                              'width_selected',
+                              lambda lw: self._apply_cell_text(row, col, lw))
+
+    def _apply_cell_text(self, row, col, text):
+        """写入单元格文本并触发一次重绘（写入期间抑制重入）"""
         item = self.grid.item(row, col)
-        if not item:
+        if item is None:
             return
-        popup = LineWidthPopupWidget(self.grid)
-
-        def on_select(lw):
-            self._suppress_redraw = True
-            item.setText(lw)
+        self._suppress_redraw = True
+        try:
+            item.setText(text)
+        finally:
             self._suppress_redraw = False
-            if self.on_parameter_changed:
-                self.on_parameter_changed()
+        if self.on_parameter_changed:
+            self.on_parameter_changed()
 
-        popup.width_selected.connect(on_select)
+    def _show_cell_popup(self, row, col, popup, signal_name, apply_fn):
+        """单元格下拉弹窗的公共逻辑：定位到单元格下方并居中显示"""
+        if self.grid.item(row, col) is None:
+            return
+        getattr(popup, signal_name).connect(apply_fn)
         rect = self.grid.visualRect(self.grid.model().index(row, col))
         pos = self.grid.viewport().mapToGlobal(rect.center())
         popup.move(pos.x() - popup.width() // 2, pos.y() + rect.height() // 2 + 4)
@@ -3050,13 +3315,17 @@ class ParameterGridPanel(QWidget):
         if len(x_data) == 0:
             return "N/A"
         if window_size == 0.0:
-            idx = np.argmin(np.abs(x_data - line_x))
-            if abs(x_data[idx] - line_x) < 0.1:
-                return f"{float(y_data[idx]):.4f}"
-            return "N/A"
+            idx = nearest_index(x_data, line_x)
+            if idx < 0 or abs(x_data[idx] - line_x) >= Config.NEAREST_POINT_TOLERANCE:
+                return "N/A"
+            return f"{float(y_data[idx]):.4f}"
         start_time, end_time = line_x - window_size, line_x + window_size
-        mask = (x_data >= start_time) & (x_data <= end_time)
-        window_data = y_data[mask]
+        if len(x_data) and x_data[0] <= x_data[-1]:
+            i0 = int(np.searchsorted(x_data, start_time, side='left'))
+            i1 = int(np.searchsorted(x_data, end_time, side='right'))
+            window_data = y_data[i0:i1]
+        else:
+            window_data = y_data[(x_data >= start_time) & (x_data <= end_time)]
         if len(window_data) == 0:
             return "N/A"
         return f"{float(np.mean(window_data)):.4f}"
@@ -3068,8 +3337,12 @@ class ParameterGridPanel(QWidget):
         x_data, y_data = channel_data['x'], channel_data['y']
         if len(x_data) == 0:
             return None
-        mask = (x_data >= start_x) & (x_data <= end_x)
-        region_data = y_data[mask]
+        if x_data[0] <= x_data[-1]:
+            i0 = int(np.searchsorted(x_data, start_x, side='left'))
+            i1 = int(np.searchsorted(x_data, end_x, side='right'))
+            region_data = y_data[i0:i1]
+        else:
+            region_data = y_data[(x_data >= start_x) & (x_data <= end_x)]
         if len(region_data) == 0:
             return None
         return {'mean': np.mean(region_data), 'max': np.max(region_data),
@@ -3082,9 +3355,11 @@ class ParameterGridPanel(QWidget):
         x_data, y_data = channel_data['x'], channel_data['y']
         if len(x_data) == 0:
             return "N/A"
-        idx = np.argmin(np.abs(x_data - time_x))
+        idx = nearest_index(x_data, time_x)
+        if idx < 0:
+            return "N/A"
         time_diff = abs(x_data[idx] - time_x)
-        return f"{float(y_data[idx]):.4f}" if time_diff <= 0.1 else "N/A"
+        return f"{float(y_data[idx]):.4f}" if time_diff <= Config.NEAREST_POINT_TOLERANCE else "N/A"
 
     def _on_cell_double_click(self, row, col):
         # 可编辑列：采样间隔(1)、图例名称(7) — 线宽(6) 为下拉选择
@@ -3440,11 +3715,26 @@ class SignalScapeMainWindow(QMainWindow):
         self._search_timer.setSingleShot(True)
         self._search_timer.timeout.connect(self._perform_search)
 
+        # 时间轴缓存：按 (点数, 采样间隔) 复用，避免每次重绘都新建大数组
+        self._time_axis_cache = {}
+
         self._create_ui()
         self._create_button_bar()
         self._create_status_bar()
         self._setup_shortcuts()
         self.showMaximized()
+
+    def closeEvent(self, event):
+        """窗口关闭：停止定时器、标记取消加载并释放文件句柄与数据缓存"""
+        try:
+            self.data_manager._cancel_load = True
+            self._redraw_timer.stop()
+            self._search_timer.stop()
+            self.data_manager.clear()  # 关闭 TDMS 句柄并释放缓存
+            self._time_axis_cache.clear()
+        except Exception as e:
+            logger.warning("关闭窗口时释放资源失败: %s", e)
+        super().closeEvent(event)
 
     def _create_button_bar(self):
         """创建按钮栏"""
@@ -3697,11 +3987,8 @@ class SignalScapeMainWindow(QMainWindow):
                 bridge.progress_update.emit(progress, f"正在加载: {file_name}")
                 if file_name in self.data_manager.files_data:
                     continue
-                lower_path = file_path.lower()
-                if lower_path.endswith('.xls') or lower_path.endswith('.xlsx'):
-                    load_ok = self.data_manager.load_excel_file(file_path)
-                else:
-                    load_ok = self.data_manager.load_tdms_file(file_path, parent_window=self)
+                # 统一按扩展名分派（Excel 走 calamine，其余走 TDMS）
+                load_ok = self.data_manager.load_file_by_ext(file_path, parent_window=self)
                 if load_ok:
                     bridge.tree_update.emit(file_name)
                     success_count[0] += 1
@@ -3719,6 +4006,9 @@ class SignalScapeMainWindow(QMainWindow):
                 feedback += f" | 已排除 {total_excluded} 个通道"
             if error_msgs:
                 feedback += " | 加载失败: " + "; ".join(error_msgs[:3])
+            # 数据层收集的提示（Excel 依赖缺失/格式问题/排除数量等）以文本回传主线程
+            for _level, text in self.data_manager.take_messages()[:3]:
+                feedback += " | " + text.replace("\n", " ")
             bridge.status_message.emit(feedback)
             bridge.load_done.emit()
 
@@ -3742,10 +4032,9 @@ class SignalScapeMainWindow(QMainWindow):
             # result == 1: 添加新文件
 
         # Excel (.xls/.xlsx) 试验数据文件：统一用 python-calamine 同步加载
-        lower_path = file_path.lower()
-        if lower_path.endswith('.xls') or lower_path.endswith('.xlsx'):
+        if self.data_manager.is_excel_path(file_path):
             try:
-                success = self.data_manager.load_excel_file(file_path)
+                success = self.data_manager.load_file_by_ext(file_path, parent_window=self)
             except Exception as e:
                 QMessageBox.critical(self, "错误",
                                      f"加载文件失败: {file_name}\n\n{type(e).__name__}: {str(e)}")
@@ -3756,6 +4045,8 @@ class SignalScapeMainWindow(QMainWindow):
                 self.status_bar.showMessage(f"已加载: {file_name}")
             else:
                 self.status_bar.showMessage("文件加载失败")
+            # 加载过程中的提示/错误（弹窗必须在主线程，数据层只收集不弹窗）
+            self._show_data_manager_messages()
             return
 
         def on_load_finished(loaded_file_path, success):
@@ -3789,6 +4080,18 @@ class SignalScapeMainWindow(QMainWindow):
         elif clicked is btn_add:
             return 1
         return 2
+
+    def _show_data_manager_messages(self):
+        """展示数据层收集到的提示/错误信息（只在主线程调用）"""
+        messages = self.data_manager.take_messages()
+        if not messages:
+            return
+        errors = [text for level, text in messages if level == 'error']
+        infos = [text for level, text in messages if level == 'info']
+        if errors:
+            QMessageBox.critical(self, "文件加载错误", "\n".join(errors))
+        elif infos:
+            self.status_bar.showMessage(" | ".join(infos))
 
     def _update_status_after_load(self, file_name):
         stats = self.data_manager.get_file_stats(file_name)
@@ -3857,11 +4160,15 @@ class SignalScapeMainWindow(QMainWindow):
                 fn = osp.basename(file_path)
                 p = int((i / total) * 100)
                 bridge.progress_update.emit(p, f"正在加载: {fn}")
-                if self.data_manager.load_tdms_file(file_path, parent_window=self):
+                # 与批量加载保持同一分派逻辑，Excel 文件不会被当作 TDMS 丢弃
+                if self.data_manager.load_file_by_ext(file_path, parent_window=self):
                     bridge.tree_update.emit(fn)
                     success_count[0] += 1
             bridge.progress_update.emit(100, "重新加载完成")
-            bridge.status_message.emit(f"已重新加载 {success_count[0]}/{total} 个文件")
+            feedback = f"已重新加载 {success_count[0]}/{total} 个文件"
+            for _level, text in self.data_manager.take_messages()[:3]:
+                feedback += " | " + text.replace("\n", " ")
+            bridge.status_message.emit(feedback)
             bridge.load_done.emit()
 
         t = threading.Thread(target=worker, daemon=True)
@@ -4005,7 +4312,8 @@ class SignalScapeMainWindow(QMainWindow):
                 if len(parts) == 3:
                     time_axis = self.data_manager.xls_time_axis.get((parts[0], parts[1]))
                 if time_axis is None or len(time_axis) != len(channel_data):
-                    time_axis = np.arange(len(channel_data)) * param_info['sample_time'] / 1000.0
+                    time_axis = self._get_time_axis(len(channel_data),
+                                                    param_info['sample_time'])
                 plots_data.append({'x_data': time_axis, 'y_data': channel_data, 'name': display_name})
         if plots_data:
             show_actual_channels = self.param_panel.get_show_actual_value_channels()
@@ -4039,6 +4347,25 @@ class SignalScapeMainWindow(QMainWindow):
             'sample_time': sample_time, 'color': color, 'linestyle': linestyle_val,
             'linewidth': linewidth, 'legend_name': legend_name, 'full_path': full_path
         }
+
+    def _get_time_axis(self, n_points, sample_time):
+        """按 (点数, 采样间隔) 缓存时间轴
+
+        原先每次重绘都为每个通道新建一个 O(n) 数组（百万点 × 多通道 = 上百 MB
+        临时分配），数据未变化时属于纯浪费。
+        """
+        try:
+            sample_time = float(sample_time)
+        except (TypeError, ValueError):
+            sample_time = Config.DEFAULT_SAMPLE_TIME
+        key = (n_points, round(sample_time, 6))
+        axis = self._time_axis_cache.get(key)
+        if axis is None:
+            axis = np.arange(n_points) * sample_time / 1000.0
+            if len(self._time_axis_cache) > 256:
+                self._time_axis_cache.clear()
+            self._time_axis_cache[key] = axis
+        return axis
 
     def _get_channel_data(self, full_path):
         parts = full_path.split('/')
@@ -4086,19 +4413,20 @@ def _resolve_app_icon():
     return None
 
 
-def main():
+def _setup_windows_dpi():
+    """Windows 专用：进程 DPI 感知、任务栏图标与 Qt 缩放（非 Windows 不调用）"""
     import ctypes
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("设置 DPI 感知失败: %s", e)
 
     # 修复任务栏图标（PyInstaller 单文件版从临时目录运行会导致任务栏图标错乱）
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
             ctypes.c_wchar_p("SignalScape.App.1.0"))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("设置 AppUserModelID 失败: %s", e)
 
     # Qt5 需要手动设置 DPI 缩放（Qt6 默认启用高 DPI 缩放）
     # 获取屏幕 DPI 并设置 QT_SCALE_FACTOR，确保 QSS 中的 px 单位正确缩放
@@ -4108,8 +4436,14 @@ def main():
         ctypes.windll.user32.ReleaseDC(0, hdc)
         if dpi > 0:
             os.environ['QT_SCALE_FACTOR'] = str(dpi / 96.0)
-    except Exception:
+    except Exception as e:
         os.environ['QT_AUTO_SCREEN_SCALE_FACTOR'] = '1'
+        logger.debug("读取屏幕 DPI 失败，改用自动缩放: %s", e)
+
+
+def main():
+    if sys.platform == 'win32':
+        _setup_windows_dpi()
 
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)

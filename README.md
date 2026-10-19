@@ -4,16 +4,11 @@
 
 ---
 
-## 版本说明
+## 版本
 
-本项目提供两种 GUI 实现，**核心功能逻辑完全一致**，仅界面框架不同：
+当前版本：**0.1.4**（版本号规则见 `CHANGELOG.md`），显示在程序窗口标题中。
 
-| 文件 | GUI 框架 | 说明 |
-|------|----------|------|
-| `SignalScape.py` | wxPython 4.2+ | 原始版本，WXAgg 后端 |
-| `SignalScape_pyside.py` | PySide2 5.15+ | 主推版本，QtAgg 后端，界面经现代美化（QSS 样式表统一美化） |
-
-> **推荐使用 `SignalScape_pyside.py`** — 基于 PySide2 / Qt 框架，界面更现代、QSS 样式表统一美化、跨平台体验更一致。
+GUI 框架为 **PySide2 5.15+**（QtAgg 后端，QSS 样式表统一美化）。
 
 ---
 
@@ -74,11 +69,11 @@
 | 组件 | 说明 |
 |------|------|
 | **Python** | 3.8+ |
-| **PySide2** | Qt for Python 界面框架（推荐版本） |
-| **wxPython** | 经典界面框架（原始版本） |
+| **PySide2** | Qt for Python 界面框架 |
 | **Matplotlib** | 绘图引擎 |
 | **NumPy** | 数值计算 |
 | **nptdms** | NI TDMS 文件读取 |
+| **python-calamine** | Excel（.xls/.xlsx）读取 |
 
 ---
 
@@ -86,25 +81,25 @@
 
 ### 环境准备
 
-**PySide2 版本（推荐）：**
 ```bash
+pip install -r requirements.txt
+# 或手动安装：
 pip install pyside2 numpy matplotlib nptdms python-calamine
-```
-
-**wxPython 版本：**
-```bash
-pip install wxpython numpy matplotlib nptdms
 ```
 
 ### 运行
 
 ```bash
-# PySide2 版本（推荐）
 python SignalScape_pyside.py
-
-# wxPython 版本
-python SignalScape.py
 ```
+
+### 测试
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+测试使用 `QT_QPA_PLATFORM=offscreen`，无需显示设备；样本文件由 `tests/make_fixtures.py` 生成。
 
 ---
 
@@ -113,11 +108,7 @@ python SignalScape.py
 使用 PyInstaller 打包为独立可执行文件：
 
 ```bash
-# PySide2 版本（推荐）
 pyinstaller SignalScape_pyside.spec
-
-# wxPython 版本
-pyinstaller SignalScape.spec
 ```
 
 打包产物：
@@ -146,12 +137,13 @@ pyinstaller SignalScape.spec
 
 ```
 SignalScape/
-├── SignalScape.py                  # wxPython 版本源代码
-├── SignalScape_pyside.py           # PySide2 版本源代码（推荐）
-├── SignalScape.spec                # wxPython 版 PyInstaller 打包配置
-├── SignalScape_pyside.spec         # PySide2 版 PyInstaller 打包配置
+├── SignalScape_pyside.py           # PySide2 版本源代码（主程序）
+├── SignalScape_pyside.spec         # PyInstaller 打包配置
+├── requirements.txt                # 运行依赖
+├── CHANGELOG.md                    # 更新日志与版本号规则
 ├── Dashboard.ico                   # 应用图标
 ├── README.md                       # 项目说明（本文件）
+├── tests/                          # 自动化测试（unittest + 合成样本数据）
 ├── Data/                           # 测试数据文件（不随项目上传）
 ├── build/                          # PyInstaller 构建缓存
 └── dist/                           # 打包输出目录
