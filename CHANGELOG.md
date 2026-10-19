@@ -43,6 +43,10 @@
 - 新增自动化测试（`tests/`，`python -m unittest discover -s tests`）
 - 移除 wxPython 旧版（`SignalScape.py` / `SignalScape.spec`），后续仅维护 PySide2 版本；新增 `requirements.txt`
 
+## 0.1.6
+
+- 数据录取线导出的有效值行名内嵌采样时刻（如 `数据录取1有效值(3.456s)`），与红/蓝轴格式一致，便于追溯
+
 ## 0.1.5
 
 - 导出成功对话框（导出数据 / 导出有效值 / 保存图像）新增「打开文件」按钮，点击后用系统默认程序直接查看刚导出的文件

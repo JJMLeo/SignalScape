@@ -332,6 +332,29 @@ class TestMainWindow(unittest.TestCase):
         pp.record_lines = []
         pp._update_record_lines()
 
+    def test_export_effective_values_includes_record_time(self):
+        """录取线导出的行名必须内含采样时刻，便于追溯"""
+        win = self.win
+        self.assertTrue(win.data_manager.load_tdms_file(TDMS_PATH))
+        win._update_channel_tree('sample.tdms')
+        item = self._find_channel(win, '温度')
+        self.assertIsNotNone(item)
+        win._add_channel_to_grid(item)
+        win._plot_selected_channels()
+        pp = win.plot_panel
+        pp.record_lines = [{'x': 5.0}, {'x': 3.456}]
+        tmp = os.path.join(FIXTURES, '_tmp_export.csv')
+        try:
+            pp._export_effective_values_csv(tmp, False, False)
+            with open(tmp, encoding='utf-8-sig') as f:
+                content = f.read()
+            # 两条录取线按时刻排序：3.456 在前
+            self.assertIn('数据录取1有效值(3.456s)', content)
+            self.assertIn('数据录取2有效值(5.000s)', content)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
     def test_open_file_with_default_app(self):
         """打开导出文件的辅助方法不应抛异常（存在/不存在的文件都要优雅处理）"""
         pp = self.win.plot_panel

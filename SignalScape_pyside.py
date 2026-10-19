@@ -109,7 +109,7 @@ from matplotlib.widgets import SpanSelector
 # =============================================================================
 APP_VERSION_MAJOR = 0   # 一级：按时设置，当前 0
 APP_VERSION_MINOR = 1   # 二级：git 推送次数
-APP_VERSION_PATCH = 5   # 三级：自上次推送以来的代码修改次数
+APP_VERSION_PATCH = 6   # 三级：自上次推送以来的代码修改次数
 APP_VERSION = "%d.%d.%d" % (APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH)
 
 
@@ -2651,7 +2651,7 @@ class MatplotlibPlotPanel(QWidget):
             parameter_names = []
             red_values, red_effective_values = [], []
             blue_values, blue_effective_values = [], []
-            # 数据录取线（按前后时刻顺序导出有效值，不含时刻数据）
+            # 数据录取线（按前后时刻顺序导出，行名内含时刻便于追溯）
             record_xs = sorted(rec['x'] for rec in self.record_lines)
             record_effective_values = [[] for _ in record_xs]
             for i in range(param_panel.grid.rowCount()):
@@ -2681,9 +2681,9 @@ class MatplotlibPlotPanel(QWidget):
             if has_blue_line:
                 writer.writerow([f"蓝轴数值({self.blue_line_x:.3f}s)"] + blue_values)
                 writer.writerow([f"蓝轴有效值({self.blue_line_x:.3f}s)"] + blue_effective_values)
-            # 数据录取线：按前后时刻顺序依次导出有效值（仅有效值，不含时刻）
-            for j in range(len(record_xs)):
-                writer.writerow([f"数据录取{j + 1}有效值"] + record_effective_values[j])
+            # 数据录取线：按前后时刻顺序依次导出，行名内嵌时刻（与红/蓝轴格式一致）
+            for j, rx in enumerate(record_xs):
+                writer.writerow([f"数据录取{j + 1}有效值({rx:.3f}s)"] + record_effective_values[j])
 
     def clear_plot(self):
         self._clear_plot()
