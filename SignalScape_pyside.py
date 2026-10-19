@@ -97,7 +97,7 @@ from matplotlib.widgets import SpanSelector
 # =============================================================================
 APP_VERSION_MAJOR = 0   # 一级：按时设置，当前 0
 APP_VERSION_MINOR = 1   # 二级：git 推送次数
-APP_VERSION_PATCH = 1   # 三级：自上次推送以来的代码修改次数
+APP_VERSION_PATCH = 3   # 三级：自上次推送以来的代码修改次数
 APP_VERSION = "%d.%d.%d" % (APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH)
 
 
@@ -2052,7 +2052,8 @@ class MatplotlibPlotPanel(QWidget):
                     y_pos = ((y_raw - ymn) / (ymx - ymn) * 100.0) if ymx != ymn else 100.0
                 else:
                     y_pos = y_raw
-                eff = self._calc_effective_value(name, x, window_size)
+                # 界面标注只显示两位小数（CSV 导出仍保留 6 位精度）
+                eff = self._calc_effective_value(name, x, window_size, decimals=2)
                 if eff is None:
                     continue
                 txt = plot_line.axes.text(
@@ -2061,8 +2062,12 @@ class MatplotlibPlotPanel(QWidget):
                     ha='left', va='bottom', zorder=12)
                 self.record_artists.append(txt)
 
-    def _calc_effective_value(self, channel_name, line_x, window_size=None):
-        """计算录取线时刻的有效值（与红/蓝竖直线计算方式一致）"""
+    def _calc_effective_value(self, channel_name, line_x, window_size=None, decimals=6):
+        """计算录取线时刻的有效值（与红/蓝竖直线计算方式一致）
+
+        decimals: 返回字符串的小数位。界面标注用 2 位（简洁），
+        CSV 导出保持默认 6 位（保留数据精度）。
+        """
         data = self.original_data.get(channel_name)
         if not data or len(data['x']) == 0:
             return None
@@ -2074,12 +2079,12 @@ class MatplotlibPlotPanel(QWidget):
         if window_size == 0.0:  # 瞬时值
             idx = int(np.argmin(np.abs(x - line_x)))
             if abs(x[idx] - line_x) < 0.1:
-                return f"{y[idx]:.6f}"
+                return f"{y[idx]:.{decimals}f}"
             return None
         mask = (x >= line_x - window_size) & (x <= line_x + window_size)
         if not np.any(mask):
             return None
-        return f"{np.mean(y[mask]):.6f}"
+        return f"{np.mean(y[mask]):.{decimals}f}"
 
     def _is_near_line(self, x, line_x, threshold=0.01):
         if line_x is None:
